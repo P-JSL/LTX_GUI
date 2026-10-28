@@ -1,61 +1,59 @@
-# LTX GUI
+# LTX GUI — Independent Restoration Engine (v0.2.0)
 
-**독립 개발한 Windows 데스크톱 영상 복원 작업 관리자**입니다. Jasna의 공개 GUI/작업 큐 구조를 비교·연구하여 새로 작성했습니다. 모자이크 탐지·복원 및 GPU 커널 자체를 구현한 독립 추론 엔진은 아닙니다. **정상 설치·활성화된 Jasna 실행 파일을 별도 프로세스로 제어**합니다.
+**JASNA를 실행·연동·복사하지 않는 독립 Windows GUI 영상 인페인팅 응용프로그램입니다.**
+Python/PySide6 UI + OpenCV(C++ 내부 최적화 연산) + 별도 설치된 FFmpeg를 사용합니다.
+JASNA, ComfyUI 또는 상용 LTX 모델/키/비공개 모듈은 필요 없습니다.
 
-> **중요:** 지원자 전용 Jasna LTX 모델과 활성화 로직은 본 저장소에 포함되지 않습니다. 무료 BasicVSR++는 별도 설치한 Jasna의 공개 기능 범위에서 사용할 수 있습니다. LTX 정품 라이선스는 원 저작자로부터 취득해야 합니다. `--ltx-trial`은 복원 영상을 생성하지 않습니다.
+> ⚠️ 현재 **LTX diffusion 모델을 구현한 것은 아닙니다.** 자체 구현한 고전적 공간·시간축
+> 인페인팅으로 선택 영역을 근사 복원하는 실동작 버전입니다. 큰 면적·복잡한 원본 콘텐츠를
+> 재구성하거나 기존에 사라진 픽셀을 진짜 원본으로 되찾을 수는 없습니다.
 
-## 설치 (Windows 10/11)
+## 기능
+- 네이티브 GUI에서 다수의 영상 파일·폴더 입력, 파일당 한 개 사각형 영역 선택 또는 마스크 이미지 지정
+- Telea 빠른 공간 인페인팅 / Farneback optical flow 기반 시간축 보정 인페인팅
+- 바깥 영역은 복원 엔진이 변경하지 않음 (재인코딩에 따른 압축 손실은 존재)
+- 입력 영상과 원본 오디오를 조합한 H.264 영상 출력(.mkv/.mp4), 오디오는 AAC로 변환
+- CPU `libx264` 인코더 또는 NVIDIA `h264_nvenc` 하드웨어 인코더 선택
+- 별도 작업 스레드, 진행률/FPS, 정지, 처리 전 검증, 충돌·덮어쓰기 방지, 임시 파일 정리
+- Unicode 경로 마스크 로딩, 환경설정 JSON 원자 저장, 별도 CLI/API/자동 테스트
 
-1. Python 3.11 이상 설치 (권장 3.12).
-2. 프로젝트 폴더에서 `py -3.12 -m venv .venv` → `.venv\Scripts\activate`.
-3. `python -m pip install -e ".[monitoring]"`.
-4. `python -m ltx_gui` 또는 `ltx-gui` 실행.
-5. GUI의 **Jasna 실행 파일**에 공식 `jasna.exe`의 실제 경로를 지정합니다. Jasna 설치 및 정품 활성화는 Jasna 공식 문서대로 별도 진행합니다.
+## 설치 (Python 3.12 권장)
+1. Windows에 `ffmpeg.exe`를 설치하고 PATH에 추가하세요. `ffmpeg -version` 확인.
+2. `py -3.12 -m venv .venv`
+3. `.venv\Scripts\activate`
+4. `python -m pip install -e ".[test]"`
+5. `python -m ltx_gui` (GUI), `python -m pytest -q` (테스트)
 
-Windows EXE 생성: `powershell -ExecutionPolicy Bypass -File scripts/build_windows.ps1`. 생성물은 `dist/LTX_GUI/`에 놓입니다. GitHub Actions에서도 Windows 빌드 아티팩트를 생성하도록 준비했습니다. Jasna 실행 파일, GPU 드라이버 또는 모델은 번들에 포함되지 않습니다.
+독립 CLI 실행 예시 (사각형 정규화 좌표 0~1):
+```
+python -m ltx_gui.cli "C:\videos\in.mp4" --rectangle 0.25,0.25,0.75,0.75 --method temporal --output "C:\videos\out.mkv"
+```
+마스크 PNG의 **흰색은 생성/변경**, 검정색은 원본 유지:
+```
+python -m ltx_gui.cli in.mp4 --mask mask.png --encoder libx264
+```
 
-## 실제 제공 기능
+GPU NVENC는 영상 **인코딩**에만 사용합니다. `--encoder h264_nvenc`를 선택하려면
+FFmpeg가 해당 인코더와 NVIDIA 드라이버를 지원해야 합니다. GPU 복원 추론 자체는 없습니다.
 
-- 다중 파일·폴더 드래그 앤 드롭, 중복 입력 제거, FIFO 작업 큐
-- 파일 단위 복원 범위 편집 (`00:10-00:25,01:10-01:30`)
-- LTX Standard/Good/High/Top, BasicVSR++, GPU 선택
-- LTX seed, RTX 50 fast, large canvas, less overlap, big-mosaic auto split, trial
-- 출력 파일 자동 생성 및 기존 파일 덮어쓰기 방지, 충돌 감지
-- BasicVSR++ 클립/오버랩, 하드웨어 CQ, H.264/HEVC/AV1 설정
-- CLI 실행/로그/상태/취소, Jasna 체크포인트 기반 재실행
-- CPU/RAM 및 NVIDIA GPU/VRAM 현황 (3초 주기, 백그라운드)
-- 설정 및 작업 목록 안전한 JSON 저장 (원자적 파일 교체)
-- 소스 전용 테스트와 Windows PyInstaller 패키징
+GUI 빌드: `powershell -ExecutionPolicy Bypass -File scripts/build_windows.ps1`.
+GitHub Actions의 Windows ZIP 아티팩트에는 Python 패키지가 묶이며 `ffmpeg.exe`는 포함되지 않습니다.
 
-## 사용 방법
+## 한계
+- 자동 모자이크/개체 감지 및 이동하는 영역을 추적하는 마스크는 구현하지 않았습니다.
+- 복원은 근사 인페인팅으로 생성적 LTX-2.5 또는 학습형 ProPainter 품질을 보장하지 않습니다.
+- VFR은 캡처된 FPS로 CFR 재인코딩되므로 타임스탬프 일치가 중요한 자료에 사용 전 검증 필요.
+- `h264_nvenc`가 없는 GPU/FFmpeg에서는 직접 CPU 인코딩으로 설정 변경 필요.
+- FFmpeg 설치와 OS/GPU 드라이버가 있어야 미디어 통합 기능이 실행됩니다.
+- UI 실제 Windows 구동은 Linux 테스트 환경에서 직접 확인하지 못했습니다.
 
-1. 파일을 목록으로 드롭하고 출력 폴더, 복원 모델, GPU 번호를 선택합니다.
-2. 일부 장면만 복원한다면 영상 한 개를 선택해 범위를 입력하고 **범위 적용**을 클릭합니다.
-3. **대기열 실행**으로 순서대로 처리합니다. 한 번에 하나의 GPU 프로세스만 실행해 VRAM 경합을 방지합니다.
-4. **중지**는 Jasna에 소프트 인터럽트를 우선 전달합니다. 같은 입력·출력·설정으로 다시 실행하면 Jasna가 지원하는 LTX 체크포인트에서 이어질 수 있습니다. 실패한 작업의 기존 임시 데이터는 자동 삭제하지 않습니다.
-5. 같은 이름의 출력 파일이 이미 있다면 실행을 거부합니다. 덮어쓰기를 원할 때는 사용자가 명시적으로 해당 파일을 이동/이름 변경해야 합니다.
+## 기술·라이선스 문서
+- [연구 검토](docs/RESEARCH.md)
+- [구현 구조 및 제약](docs/ANALYSIS.md)
+- [복잡도 및 성능](docs/PERFORMANCE.md)
+- 독립 코드: MIT (LICENSE); OpenCV>=4.5: Apache-2.0; FFmpeg(외부 설치): 빌드별 라이선스 별도
+- JASNA: https://github.com/Kruk2/jasna (아이디어·비교 문서 참고, 소스 복사·실행 없음)
+- LTX-2.x 사용 조건: https://github.com/Lightricks/LTX-2/blob/main/LICENSE-2_x
 
-## 요구사항 및 제한사항
-
-- 이 프로그램만 설치해서 LTX 영상 복원이 가능한 것은 **아닙니다**. GPU 드라이버·Jasna·모델·라이선스는 외부 요구사항입니다.
-- **Jasna 공식 CLI**의 `--input`, `--output`, `--restoration-model-name`, `--ltx-*`, `--segments` 등을 호출합니다. 릴리스에 따라 옵션이 변경될 수 있으므로 사용할 버전에서 `jasna --help`로 확인하세요.
-- 진행률은 CLI 텍스트에서 식별 가능한 퍼센트만 표시합니다. 일부 버전/단계에서는 로그만 갱신되며 전체 작업 진행률이 아닙니다.
-- 선택 구간(`--segments`) 처리 시 Jasna가 원본 코덱을 보존하므로 GUI의 코덱/CQ 값은 전달하지 않습니다.
-- `--ltx-auto-split`과 수동 복원 범위는 동시에 사용할 수 없습니다.
-- RTX 50 전용 빠른 모드를 지원하지 않는 GPU에서 사용하면 Jasna가 오류를 반환할 수 있습니다.
-- 모델의 GPU 연산, 정밀도, TensorRT/CUDA 커널은 Jasna 실행 엔진이 관리합니다. GUI는 이를 임의로 변경하지 않습니다.
-- DRM/라이선스 우회, 비공개 체크포인트 복호화 또는 배포 기능은 제공하지 않습니다.
-- Windows GUI 실기기 시험과 실제 NVIDIA/AMD GPU 성능 측정은 별도로 필요합니다.
-
-## 속도 및 검증
-
-알고리즘 분석: [docs/ANALYSIS.md](docs/ANALYSIS.md) / [docs/PERFORMANCE.md](docs/PERFORMANCE.md)
-
-테스트: `python -m pip install -e ".[test]"` 후 `python -m pytest -q`. 테스트는 가상 CLI로 프로세스 성공/오류/취소 경로를 검증하며, 실제 모자이크 제거 품질이나 GPU 속도를 측정하지 않습니다.
-
-## 출처·라이선스
-
-- Jasna: https://github.com/Kruk2/jasna — 자체 소스는 AGPL-3.0-only, 일부 LTX 구성요소는 LTX-2.x Community License, 비공개 보호 모듈 및 유료 모델은 별도 약관입니다.
-- Jasna 명령줄 안내: https://github.com/Kruk2/jasna/blob/main/docs/en/cli.md
-- Jasna 라이선스 설명: https://github.com/Kruk2/jasna/blob/main/LICENSING.md
-- 본 프로젝트의 **독립 개발 GUI/작업 관리 코드**는 MIT License입니다. Jasna 코드는 복사/링크/패키징하지 않았습니다. Jasna를 번들로 묶거나 개조해 배포하려면 원 프로젝트 및 제3자 구성요소의 라이선스 의무를 따로 확인해야 합니다.
+원본 JASNA 버전과 모델, 가중치, 실측 GPU 결과를 본 프로그램의 성능이나 라이선스에 포함해
+표현하지 않습니다. 이 프로그램의 독립성은 **실행 중 JASNA 미사용**을 뜻합니다.

@@ -1,603 +1,415 @@
-"""PySide6 Windows/Linux GUI; compute engine stays in an external Jasna process."""
+"""Independent Qt frontend with manual spatial-mask selection and streaming processing."""
 from __future__ import annotations
 
-import os
-import shutil
 import sys
-import threading
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, Qt, QThread, QUrl, Signal, Slot
-from PySide6.QtGui import QDesktopServices, QPalette, QColor
+import cv2
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, QPoint, QRect, Qt, QThread, Signal, Slot
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QFrame,
-    QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
-    QScrollArea, QSpinBox, QTableView, QVBoxLayout, QWidget,
+    QApplication, QComboBox, QDialog, QFileDialog, QFormLayout, QGridLayout,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
+    QPlainTextEdit, QProgressBar, QPushButton, QDoubleSpinBox, QSpinBox,
+    QTableView, QVBoxLayout, QWidget,
 )
 
 from .config import load_settings, save_settings
-from .core import Job, JobQueue, Options, QUALITY_MODELS, VIDEO_EXTENSIONS, plan_queue, validate_segments
+from .core import Job, JobQueue, Options, Rectangle, VIDEO_EXTENSIONS, plan_queue
 from .runner import BatchRunner, Update
-from .telemetry import cpu_ram_stats, gpu_stats
 
 
-class QueueTable(QAbstractTableModel):
-    HEADERS = ("파일", "복원 구간", "상태", "출력")
+class QueueModel(QAbstractTableModel):
+    columns = ("파일", "영역 / 마스크", "상태")
 
-    def __init__(self, queue: JobQueue) -> None:
+    def __init__(self, queue: JobQueue):
         super().__init__()
         self.queue = queue
         self.states: dict[int, str] = {}
 
-    def rowCount(self, parent=QModelIndex()) -> int:
+    def rowCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else len(self.queue)
 
-    def columnCount(self, parent=QModelIndex()) -> int:
-        return 0 if parent.isValid() else 4
+    def columnCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else 3
 
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
         if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
-            return self.HEADERS[section]
+            return self.columns[section]
         return None
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid():
             return None
-        if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ToolTipRole):
-            job = self.queue[index.row()]
-            return (Path(job.input_path).name, job.segments or "전체", self.states.get(index.row(), "대기"),
-                    Path(job.output_path).name if job.output_path else "자동 생성")[index.column()]
-        if role == Qt.ItemDataRole.ForegroundRole:
-            status = self.states.get(index.row(), "")
-            if status == "완료":
-                return QColor("#66d5a4")
-            if status in ("실패", "중지"):
-                return QColor("#ff8a8a")
+        if role == Qt.ItemDataRole.DisplayRole:
+            item = self.queue[index.row()]
+            region = item.rectangle.as_text() if item.rectangle else (Path(item.mask_path).name if item.mask_path else "미지정")
+            return (Path(item.input_path).name, region, self.states.get(index.row(), "대기"))[index.column()]
         return None
 
-    def add_jobs(self, jobs: list[Job]) -> int:
-        valid = []
-        seen: set[str] = set()
-        for job in jobs:
-            path = Path(job.input_path)
-            key = os.path.normcase(str(path.expanduser().resolve()))
-            if key not in seen and not self.queue.contains(job.input_path):
-                seen.add(key)
-                valid.append(job)
-        if not valid:
-            return 0
-        first = len(self.queue)
-        self.beginInsertRows(QModelIndex(), first, first + len(valid) - 1)
-        for job in valid:
-            self.queue.add(job)
-        self.endInsertRows()
-        return len(valid)
-
-    def remove_rows(self, indices: list[int]):
-        for row in sorted(set(indices), reverse=True):
-            if 0 <= row < len(self.queue):
-                self.beginRemoveRows(QModelIndex(), row, row)
-                self.queue.remove_at(row)
-                self.endRemoveRows()
-        self.states.clear()
-
-    def clear(self) -> None:
+    def add(self, jobs: list[Job]):
         self.beginResetModel()
-        self.queue.clear()
-        self.states.clear()
+        for job in jobs:
+            self.queue.add(job)
         self.endResetModel()
 
-    def edit_segments(self, row: int, segments: str) -> None:
-        # Replacing a selected row preserves its place in the queue.
-        self.queue.update_at(row, segments=segments)
-        self.dataChanged.emit(self.index(row, 1), self.index(row, 1))
+    def refresh(self):
+        self.beginResetModel()
+        self.endResetModel()
 
-    def set_state(self, row: int, state: str) -> None:
-        self.states[row] = state
-        self.dataChanged.emit(self.index(row, 2), self.index(row, 2))
-
-    def reset_statuses(self) -> None:
+    def remove(self, rows: list[int]):
+        for row in sorted(rows, reverse=True):
+            self.beginRemoveRows(QModelIndex(), row, row)
+            self.queue.remove_at(row)
+            self.endRemoveRows()
         self.states.clear()
-        if len(self.queue):
-            self.dataChanged.emit(self.index(0, 2), self.index(len(self.queue)-1, 2))
+        self.refresh()
+
+    def set_state(self, index: int, state: str):
+        self.states[index] = state
+        self.dataChanged.emit(self.index(index, 2), self.index(index, 2))
 
 
-class DropTable(QTableView):
-    file_dropped = Signal(list)
-
-    def __init__(self) -> None:
+class SelectionCanvas(QLabel):
+    def __init__(self, frame):
         super().__init__()
-        self.setAcceptDrops(True)
-        self.setDragDropMode(QTableView.DragDropMode.DropOnly)
+        h, w = frame.shape[:2]
+        scale = min(880/w, 520/h, 1.0)
+        size = (max(1, round(w*scale)), max(1, round(h*scale)))
+        preview = cv2.cvtColor(cv2.resize(frame, size), cv2.COLOR_BGR2RGB)
+        ph, pw = preview.shape[:2]
+        image = QImage(preview.data, pw, ph, 3*pw, QImage.Format.Format_RGB888).copy()
+        self.pix = QPixmap.fromImage(image)
+        self.setFixedSize(self.pix.size())
+        self.start: QPoint | None = None
+        self.end: QPoint | None = None
 
-    def dragEnterEvent(self, event) -> None:
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            super().dragEnterEvent(event)
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.start = event.position().toPoint()
+            self.end = self.start
+            self.update()
 
-    def dragMoveEvent(self, event) -> None:
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            super().dragMoveEvent(event)
+    def mouseMoveEvent(self, event):
+        if self.start is not None:
+            self.end = event.position().toPoint()
+            self.update()
 
-    def dropEvent(self, event) -> None:
-        if event.mimeData().hasUrls():
-            paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
-            self.file_dropped.emit(paths)
-            event.acceptProposedAction()
-        else:
-            super().dropEvent(event)
+    def mouseReleaseEvent(self, event):
+        if self.start is not None:
+            self.end = event.position().toPoint()
+            self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.drawPixmap(0, 0, self.pix)
+        if self.start and self.end:
+            painter.setPen(QPen(QColor("#00d4ff"), 2))
+            painter.fillRect(QRect(self.start, self.end).normalized(), QColor(0, 200, 255, 65))
+            painter.drawRect(QRect(self.start, self.end).normalized())
+        painter.end()
+
+    def rectangle(self) -> Rectangle:
+        if self.start is None or self.end is None:
+            raise ValueError("복원할 영역을 마우스로 드래그하세요.")
+        rect = QRect(self.start, self.end).normalized()
+        w, h = self.width(), self.height()
+        x0 = max(0, min(w, rect.left()))/w
+        y0 = max(0, min(h, rect.top()))/h
+        x1 = max(0, min(w, rect.right()+1))/w
+        y1 = max(0, min(h, rect.bottom()+1))/h
+        region = Rectangle(x0, y0, x1, y1)
+        region.validate()
+        return region
 
 
-class RunWorker(QObject):
+class RegionDialog(QDialog):
+    def __init__(self, filename: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("첫 프레임에서 마스크 영역 지정")
+        stream = cv2.VideoCapture(filename)
+        try:
+            okay, frame = stream.read()
+        finally:
+            stream.release()
+        if not okay:
+            raise ValueError("첫 번째 프레임을 열 수 없습니다.")
+        self.canvas = SelectionCanvas(frame)
+        panel = QVBoxLayout(self)
+        panel.addWidget(QLabel("마우스로 복원 영역을 드래그하세요. 선택 영역만 변경됩니다."))
+        panel.addWidget(self.canvas)
+        row = QHBoxLayout()
+        confirm = QPushButton("영역 적용")
+        cancel = QPushButton("취소")
+        confirm.clicked.connect(self._accept)
+        cancel.clicked.connect(self.reject)
+        row.addWidget(confirm)
+        row.addWidget(cancel)
+        panel.addLayout(row)
+        self.selected: Rectangle | None = None
+
+    def _accept(self):
+        try:
+            self.selected = self.canvas.rectangle()
+        except ValueError as exc:
+            QMessageBox.warning(self, "영역 오류", str(exc))
+            return
+        self.accept()
+
+
+class Worker(QObject):
     update = Signal(object)
     finished = Signal()
 
-    def __init__(self, planned) -> None:
+    def __init__(self, planned, options):
         super().__init__()
+        self.runner = BatchRunner(self.update.emit, options)
         self.planned = planned
-        self.runner = BatchRunner(self.update.emit)
 
     @Slot()
-    def execute(self) -> None:
+    def execute(self):
         try:
             self.runner.run(self.planned)
-        except Exception as exc:
-            self.update.emit(Update(-1, "failed", f"작업자 예외: {exc}"))
         finally:
             self.finished.emit()
-
-
-class ResourceWorker(QThread):
-    stats = Signal(str)
-
-    def __init__(self, parent=None) -> None:
-        super().__init__(parent)
-        self._halt = threading.Event()
-
-    def run(self) -> None:
-        while not self._halt.is_set():
-            cpu, ram = cpu_ram_stats()
-            devices = gpu_stats()
-            parts = [f"CPU {cpu:.0f}%" if cpu is not None else "CPU -",
-                     f"RAM {ram:.0f}%" if ram is not None else "RAM -"]
-            if devices:
-                parts.extend(f"GPU {d.index} {d.utilization_percent}% / VRAM {d.used_mib:,}/{d.total_mib:,} MiB"
-                             for d in devices)
-            else:
-                parts.append("NVIDIA GPU 정보 없음 (AMD/기타 GPU는 실행 엔진에서 확인)")
-            self.stats.emit("   |   ".join(parts))
-            self._halt.wait(3)
-
-    def stop(self) -> None:
-        self._halt.set()
-
-
-STYLE = """
-QWidget { font-family: 'Segoe UI', 'Malgun Gothic', sans-serif; font-size: 12px;
-          background: #111823; color: #e5ecf3; }
-QMainWindow { background: #0e1520; }
-QFrame#TopBanner { background: #192335; border-radius: 12px; }
-QLabel#AppTitle { font-size: 24px; font-weight: 750; color: #f2f7ff; }
-QLabel#Muted { color: #96a6b8; }
-QGroupBox { border: 1px solid #2c3a4c; border-radius: 9px;
-            margin-top: 12px; padding-top: 14px; font-weight: 600; }
-QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 7px; }
-QPushButton { background: #25344b; padding: 8px 14px;
-              border: 1px solid #354960; border-radius: 7px; }
-QPushButton:hover { background: #344967; }
-QPushButton:disabled { background: #192230; color: #65758a; }
-QPushButton#Primary { background: #356ee7; border-color: #477ef1; font-weight: 700; }
-QPushButton#Primary:hover { background: #4c82f3; }
-QPushButton#Danger { background: #56313e; border-color: #814352; }
-QLineEdit, QComboBox, QSpinBox, QPlainTextEdit { background: #172334;
-    color: #eaf1ff; border: 1px solid #37475c; border-radius: 5px; padding: 6px; }
-QComboBox QAbstractItemView { background: #202e41; }
-QTableView { background: #152131; alternate-background-color: #19283a;
-             gridline-color: #2c3a50; selection-background-color: #285390;
-             border: 1px solid #304156; border-radius: 7px; }
-QHeaderView::section { background: #202f44; color: #c9d6e6; padding: 8px;
-                        border: none; border-right: 1px solid #304054; }
-QProgressBar { background: #202c3a; color: white; border: 1px solid #344658;
-               border-radius: 5px; text-align: center; height: 18px; }
-QProgressBar::chunk { background: #3675e3; border-radius: 4px; }
-QScrollArea { border: 0; }
-"""
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("LTX GUI  |  영상 복원 작업 관리자")
-        self.resize(1340, 860)
-        self.setMinimumSize(990, 660)
-        options, stored_jobs = load_settings()
-        self.queue = JobQueue(stored_jobs)
-        self.model = QueueTable(self.queue)
-        self._thread: QThread | None = None
-        self._worker: RunWorker | None = None
-        self._planned = []
-        self._busy = False
-        self._build(options)
-        self.resources = ResourceWorker(self)
-        self.resources.stats.connect(self.stats_label.setText)
-        self.resources.start()
-        self._log("프로그램 준비 완료. Jasna LTX 모델은 별도로 설치 및 정품 활성화해야 합니다.")
+        self.setWindowTitle("LTX GUI | Independent Video Restoration")
+        self.resize(1120, 850)
+        try:
+            opts, saved = load_settings()
+        except (ValueError, OSError, KeyError) as exc:
+            opts, saved = Options(), []
+        self.queue = JobQueue(saved)
+        self.model = QueueModel(self.queue)
+        self.busy = False
+        self.worker = None
+        self.thread = None
+        base = QWidget()
+        self.setCentralWidget(base)
+        layout = QVBoxLayout(base)
 
-    def _build(self, options: Options) -> None:
-        root = QWidget()
-        self.setCentralWidget(root)
-        layout = QVBoxLayout(root)
-        layout.setSpacing(12)
-        layout.setContentsMargins(18, 15, 18, 15)
-        banner = QFrame(objectName="TopBanner")
-        top = QVBoxLayout(banner)
-        title = QLabel("LTX GUI", objectName="AppTitle")
-        top.addWidget(title)
-        top.addWidget(QLabel("고성능 영상 복원 · GPU 작업 대기열 · LTX / BasicVSR++ 실행 제어", objectName="Muted"))
-        layout.addWidget(banner)
+        description = QLabel("독립 영상 인페인팅 엔진 · Jasna 사용 안 함 · 지정한 영역만 복원")
+        description.setStyleSheet("font-weight: 650; font-size: 17px; color: #247fc2;")
+        layout.addWidget(description)
+        row = QHBoxLayout()
+        for title, call in (("영상 추가", self.add_files), ("폴더 추가", self.add_folder),
+                            ("영역 선택", self.select_region), ("마스크 이미지", self.select_mask),
+                            ("선택 제거", self.remove_selected)):
+            button = QPushButton(title)
+            button.clicked.connect(call)
+            row.addWidget(button)
+        layout.addLayout(row)
 
-        main = QHBoxLayout()
-        main.setSpacing(13)
-        layout.addLayout(main, stretch=1)
-        left = QVBoxLayout()
-        main.addLayout(left, stretch=3)
-        right = QScrollArea()
-        right.setWidgetResizable(True)
-        right.setMinimumWidth(345)
-        right.setMaximumWidth(450)
-        main.addWidget(right, stretch=2)
-        settings_holder = QWidget()
-        right.setWidget(settings_holder)
-        settings_layout = QVBoxLayout(settings_holder)
-        settings_layout.setContentsMargins(2, 2, 2, 2)
-
-        queue_group = QGroupBox("작업 대기열  ·  파일을 여기로 끌어놓을 수 있습니다")
-        queue_box = QVBoxLayout(queue_group)
-        self.table = DropTable()
+        self.table = QTableView()
         self.table.setModel(self.model)
-        self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QTableView.SelectionMode.ExtendedSelection)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        self.table.verticalHeader().hide()
-        self.table.file_dropped.connect(self._add_paths)
-        queue_box.addWidget(self.table)
-        btns = QHBoxLayout()
-        for text, handler in (("파일 추가", self._add_files), ("폴더 추가", self._add_folder),
-                              ("선택 제거", self._remove_selected), ("전체 지우기", self._clear_jobs),
-                              ("영상 열기", self._open_input)):
-            button = QPushButton(text)
-            button.clicked.connect(handler)
-            btns.addWidget(button)
-        queue_box.addLayout(btns)
-        left.addWidget(queue_group, stretch=4)
+        layout.addWidget(self.table)
 
-        segment_group = QGroupBox("선택 영상의 복원 범위")
-        seg_box = QVBoxLayout(segment_group)
-        seg_box.addWidget(QLabel("비워 두면 전체 영상 / 예: 00:10-00:25,01:10-01:30"))
-        segrow = QHBoxLayout()
-        self.segments = QLineEdit()
-        self.segments.setPlaceholderText("시작-종료,시작-종료")
-        segrow.addWidget(self.segments, 1)
-        self.apply_segments = QPushButton("범위 적용")
-        self.apply_segments.clicked.connect(self._set_segments)
-        segrow.addWidget(self.apply_segments)
-        seg_box.addLayout(segrow)
-        left.addWidget(segment_group)
-        self.table.selectionModel().selectionChanged.connect(self._select_row)
+        controls = QGridLayout()
+        self.output = QLineEdit(opts.output_dir)
+        self.output.setPlaceholderText("공백이면 원본 폴더")
+        out_btn = QPushButton("찾기")
+        out_btn.clicked.connect(self.choose_output)
+        controls.addWidget(QLabel("출력 폴더"), 0, 0)
+        controls.addWidget(self.output, 0, 1)
+        controls.addWidget(out_btn, 0, 2)
 
-        info_group = QGroupBox("진행 상태 / 실행 로그")
-        info_box = QVBoxLayout(info_group)
+        self.ffmpeg = QLineEdit(opts.ffmpeg)
+        controls.addWidget(QLabel("FFmpeg 명령"), 1, 0)
+        controls.addWidget(self.ffmpeg, 1, 1, 1, 2)
+
+        self.method = QComboBox()
+        self.method.addItem("빠른 공간 인페인팅 (Telea)", "fast")
+        self.method.addItem("시간축 Optical Flow + Telea", "temporal")
+        self.method.setCurrentIndex(0 if opts.method == "fast" else 1)
+        self.encoder = QComboBox()
+        self.encoder.addItem("CPU H.264 (libx264)", "libx264")
+        self.encoder.addItem("NVIDIA GPU 인코딩 (NVENC)", "h264_nvenc")
+        self.encoder.setCurrentIndex(0 if opts.encoder == "libx264" else 1)
+        controls.addWidget(QLabel("복원 알고리즘"), 2, 0)
+        controls.addWidget(self.method, 2, 1, 1, 2)
+        controls.addWidget(QLabel("출력 인코딩"), 3, 0)
+        controls.addWidget(self.encoder, 3, 1, 1, 2)
+
+        self.radius = QSpinBox()
+        self.radius.setRange(1, 20)
+        self.radius.setValue(opts.radius)
+        self.weight = QDoubleSpinBox()
+        self.weight.setRange(0, 0.8)
+        self.weight.setSingleStep(0.05)
+        self.weight.setValue(opts.temporal_weight)
+        self.flow = QDoubleSpinBox()
+        self.flow.setRange(0.125, 1.0)
+        self.flow.setSingleStep(0.125)
+        self.flow.setValue(opts.flow_scale)
+        advanced = QHBoxLayout()
+        for title, widget in (("공간 반경", self.radius), ("Temporal 가중치", self.weight), ("Flow 배율", self.flow)):
+            advanced.addWidget(QLabel(title))
+            advanced.addWidget(widget)
+        controls.addLayout(advanced, 4, 0, 1, 3)
+        layout.addLayout(controls)
+
+        action = QHBoxLayout()
+        self.start = QPushButton("▶ 복원 실행")
+        self.start.clicked.connect(self.start_jobs)
+        self.cancel = QPushButton("■ 안전 중지")
+        self.cancel.clicked.connect(self.stop_jobs)
+        self.cancel.setEnabled(False)
+        save_btn = QPushButton("대기열·설정 저장")
+        save_btn.clicked.connect(self.persist)
+        for b in (self.start, self.cancel, save_btn):
+            action.addWidget(b)
+        layout.addLayout(action)
         self.progress = QProgressBar()
-        self.progress.setRange(0, 100)
-        info_box.addWidget(self.progress)
-        self.stage_label = QLabel("대기")
-        info_box.addWidget(self.stage_label)
+        layout.addWidget(self.progress)
         self.logs = QPlainTextEdit()
         self.logs.setReadOnly(True)
-        self.logs.document().setMaximumBlockCount(1500)
-        info_box.addWidget(self.logs, stretch=1)
-        left.addWidget(info_group, stretch=2)
+        self.logs.setMaximumBlockCount(1500)
+        layout.addWidget(self.logs)
+        self.statusBar().showMessage("독립 CPU 복원 파이프라인. GPU는 NVENC 인코딩에서만 사용합니다.")
 
-        paths_group = QGroupBox("실행 환경")
-        path_form = QFormLayout(paths_group)
-        self.exec_edit = QLineEdit(options.executable)
-        exe_row = QHBoxLayout()
-        exe_row.addWidget(self.exec_edit, 1)
-        browse_exe = QPushButton("찾기")
-        browse_exe.clicked.connect(self._browse_executable)
-        exe_row.addWidget(browse_exe)
-        path_form.addRow("Jasna 실행 파일", exe_row)
-        self.output_edit = QLineEdit(options.output_dir)
-        out_row = QHBoxLayout()
-        out_row.addWidget(self.output_edit, 1)
-        browse_out = QPushButton("찾기")
-        browse_out.clicked.connect(self._browse_output)
-        out_row.addWidget(browse_out)
-        path_form.addRow("출력 폴더", out_row)
-        settings_layout.addWidget(paths_group)
+    def selected_row(self):
+        idx = self.table.selectionModel().selectedRows()
+        if len(idx) != 1:
+            raise ValueError("대기열에서 영상 하나를 선택하세요.")
+        return idx[0].row()
 
-        model_group = QGroupBox("복원 모델")
-        model_form = QFormLayout(model_group)
-        self.quality = QComboBox()
-        self.quality.addItems(list(QUALITY_MODELS))
-        self.quality.setCurrentText(options.quality)
-        model_form.addRow("품질", self.quality)
-        self.gpu = QSpinBox()
-        self.gpu.setRange(0, 63)
-        self.gpu.setValue(options.gpu_index)
-        model_form.addRow("GPU 번호", self.gpu)
-        self.seed = QLineEdit(str(options.seed))
-        model_form.addRow("시드", self.seed)
-        self.fast = QCheckBox("RTX 50 전용 빠른 모드")
-        self.fast.setChecked(options.fast)
-        model_form.addRow(self.fast)
-        self.large = QCheckBox("큰 모자이크 고품질 처리 (VRAM 증가)")
-        self.large.setChecked(options.large_canvas)
-        model_form.addRow(self.large)
-        self.overlap = QCheckBox("LTX 프레임 겹침 최소화")
-        self.overlap.setChecked(options.less_overlap)
-        model_form.addRow(self.overlap)
-        self.trial = QCheckBox("LTX 속도 테스트 (영상 복원 안 함)")
-        self.trial.setChecked(options.trial)
-        model_form.addRow(self.trial)
-        self.auto_split = QSpinBox()
-        self.auto_split.setRange(0, 100)
-        self.auto_split.setSuffix(" %  (0=사용 안 함)")
-        self.auto_split.setValue(options.auto_split_percent)
-        model_form.addRow("LTX 큰 영역 우선", self.auto_split)
-        settings_layout.addWidget(model_group)
-
-        encode_group = QGroupBox("인코딩 / BasicVSR++ 고급 설정")
-        enc_form = QFormLayout(encode_group)
-        self.codec = QComboBox()
-        self.codec.addItems(["hevc", "h264", "av1"])
-        self.codec.setCurrentText(options.codec)
-        enc_form.addRow("영상 코덱", self.codec)
-        self.cq = QSpinBox()
-        self.cq.setRange(-1, 63)
-        self.cq.setSpecialValueText("GPU 기본값")
-        self.cq.setValue(-1 if options.cq is None else options.cq)
-        enc_form.addRow("CQ (낮을수록 고화질)", self.cq)
-        self.clip = QSpinBox()
-        self.clip.setRange(2, 10000)
-        self.clip.setValue(options.basic_clip_size)
-        enc_form.addRow("BasicVSR++ 클립 프레임", self.clip)
-        self.basic_overlap = QSpinBox()
-        self.basic_overlap.setRange(0, 4999)
-        self.basic_overlap.setValue(options.basic_overlap)
-        enc_form.addRow("BasicVSR++ 프레임 겹침", self.basic_overlap)
-        settings_layout.addWidget(encode_group)
-        settings_layout.addStretch(1)
-
-        toolbar = QHBoxLayout()
-        self.start_button = QPushButton("▶  대기열 실행")
-        self.start_button.setObjectName("Primary")
-        self.start_button.clicked.connect(self._start)
-        toolbar.addWidget(self.start_button)
-        self.stop_button = QPushButton("■  중지 / 체크포인트 저장")
-        self.stop_button.setObjectName("Danger")
-        self.stop_button.setEnabled(False)
-        self.stop_button.clicked.connect(self._stop)
-        toolbar.addWidget(self.stop_button)
-        save_btn = QPushButton("설정 저장")
-        save_btn.clicked.connect(self._save)
-        toolbar.addWidget(save_btn)
-        layout.addLayout(toolbar)
-        self.stats_label = QLabel("자원 정보 확인 중...", objectName="Muted")
-        layout.addWidget(self.stats_label)
-        self.statusBar().showMessage("LTX GUI · Jasna 프로그램 및 라이선스는 별도로 설치해야 합니다.")
-        self.setStyleSheet(STYLE)
-        self.quality.currentTextChanged.connect(self._quality_changed)
-        self._quality_changed(self.quality.currentText())
-
-    def _quality_changed(self, quality: str) -> None:
-        ltx = quality != "BasicVSR++"
-        for control in (self.seed, self.fast, self.large, self.overlap, self.trial, self.auto_split):
-            control.setEnabled(ltx and not self._busy)
-        for control in (self.clip, self.basic_overlap):
-            control.setEnabled(not ltx and not self._busy)
-
-    def _options(self) -> Options:
-        try:
-            seed = int(self.seed.text())
-        except ValueError:
-            raise ValueError("시드는 정수로 입력하세요.") from None
-        return Options(executable=self.exec_edit.text().strip(),
-                       output_dir=self.output_edit.text().strip(),
-                       quality=self.quality.currentText(), gpu_index=self.gpu.value(),
-                       codec=self.codec.currentText(), seed=seed,
-                       fast=self.fast.isChecked(), large_canvas=self.large.isChecked(),
-                       less_overlap=self.overlap.isChecked(), trial=self.trial.isChecked(),
-                       auto_split_percent=self.auto_split.value(),
-                       basic_clip_size=self.clip.value(), basic_overlap=self.basic_overlap.value(),
-                       cq=None if self.cq.value() == -1 else self.cq.value())
-
-    def _log(self, message: str) -> None:
-        self.logs.appendPlainText(message)
-
-    def _browse_executable(self):
-        result, _ = QFileDialog.getOpenFileName(self, "Jasna 실행 파일 선택", "", "실행 파일 (*.exe);;모든 파일 (*)")
-        if result:
-            self.exec_edit.setText(result)
-
-    def _browse_output(self):
-        result = QFileDialog.getExistingDirectory(self, "영상 출력 폴더 선택")
-        if result:
-            self.output_edit.setText(result)
-
-    def _add_files(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "영상 파일 추가", "", "영상 (*.mp4 *.mkv *.mov *.avi *.webm *.m4v *.ts)")
-        self._add_paths(paths)
-
-    def _add_folder(self):
-        path = QFileDialog.getExistingDirectory(self, "폴더에서 영상 추가")
-        if path:
-            self._add_paths([path])
-
-    def _add_paths(self, paths: list[str]) -> None:
-        if self._busy:
+    def add_files(self):
+        if self.busy:
             return
-        candidates = []
-        for name in paths:
-            path = Path(name)
-            if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS:
-                candidates.append(Job(str(path.resolve())))
-            elif path.is_dir():
-                # One filesystem traversal, no O(n^2) duplicate comparisons.
-                candidates.extend(Job(str(p.resolve())) for p in path.rglob("*")
-                                  if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS)
-        count = self.model.add_jobs(candidates)
-        self._log(f"대기열에 {count}개 파일을 추가했습니다. (중복은 무시)")
+        paths, _ = QFileDialog.getOpenFileNames(self, "영상 선택", "", "Videos (*.mp4 *.mkv *.mov *.avi *.webm *.m4v)")
+        self.model.add([Job(path) for path in paths])
 
-    def _selected_rows(self) -> list[int]:
-        return sorted({index.row() for index in self.table.selectionModel().selectedRows()})
-
-    def _select_row(self, *args) -> None:
-        rows = self._selected_rows()
-        if len(rows) == 1:
-            self.segments.setText(self.queue[rows[0]].segments)
-        else:
-            self.segments.clear()
-
-    def _set_segments(self):
-        if self._busy:
+    def add_folder(self):
+        if self.busy:
             return
-        rows = self._selected_rows()
-        if len(rows) != 1:
-            QMessageBox.information(self, "영상 선택", "영상을 1개 선택하세요.")
+        folder = QFileDialog.getExistingDirectory(self, "폴더 선택")
+        if folder:
+            self.model.add([Job(str(p)) for p in Path(folder).rglob("*") if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS])
+
+    def remove_selected(self):
+        if not self.busy:
+            self.model.remove([x.row() for x in self.table.selectionModel().selectedRows()])
+
+    def select_region(self):
+        if self.busy:
             return
         try:
-            segments = validate_segments(self.segments.text())
+            index = self.selected_row()
+            dialog = RegionDialog(self.queue[index].input_path, self)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self.queue.update_at(index, rectangle=dialog.selected, mask_path="")
+                self.model.refresh()
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "영역 선택", str(exc))
+
+    def select_mask(self):
+        if self.busy:
+            return
+        try:
+            index = self.selected_row()
         except ValueError as exc:
-            QMessageBox.warning(self, "범위 오류", str(exc))
+            QMessageBox.warning(self, "마스크", str(exc))
             return
-        self.model.edit_segments(rows[0], segments)
+        path, _ = QFileDialog.getOpenFileName(self, "흰색=복원, 검정=보존", "", "Image (*.png *.bmp *.jpg *.jpeg)")
+        if path:
+            self.queue.update_at(index, rectangle=None, mask_path=path)
+            self.model.refresh()
 
-    def _remove_selected(self):
-        if not self._busy:
-            self.model.remove_rows(self._selected_rows())
+    def choose_output(self):
+        folder = QFileDialog.getExistingDirectory(self, "출력 폴더")
+        if folder:
+            self.output.setText(folder)
 
-    def _clear_jobs(self):
-        if not self._busy:
-            self.model.clear()
+    def options(self):
+        return Options(output_dir=self.output.text().strip(), method=self.method.currentData(),
+                       encoder=self.encoder.currentData(), radius=self.radius.value(),
+                       temporal_weight=self.weight.value(), flow_scale=self.flow.value(),
+                       ffmpeg=self.ffmpeg.text().strip())
 
-    def _open_input(self):
-        rows = self._selected_rows()
-        if len(rows) == 1:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(self.queue[rows[0]].input_path))
-
-    def _save(self):
+    def persist(self):
         try:
-            opts = self._options()
-            save_settings(opts, self.queue.items())
-            self._log("설정 및 대기열 저장 완료")
-        except (OSError, ValueError) as exc:
-            QMessageBox.warning(self, "저장 오류", str(exc))
+            save_settings(self.options(), self.queue.items())
+            self.logs.appendPlainText("설정 저장 완료")
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "설정 저장", str(exc))
 
-    def _set_busy(self, busy: bool):
-        self._busy = busy
-        self.start_button.setEnabled(not busy)
-        self.stop_button.setEnabled(busy)
-        self.apply_segments.setEnabled(not busy)
-        self.table.setEnabled(not busy)
-        self.quality.setEnabled(not busy)
-        for control in (self.exec_edit, self.output_edit, self.codec, self.cq, self.gpu):
-            control.setEnabled(not busy)
-        self._quality_changed(self.quality.currentText())
-
-    def _start(self):
-        if self._busy or not len(self.queue):
+    def start_jobs(self):
+        if self.busy or not len(self.queue):
             return
         try:
-            opts = self._options()
-            if opts.trial:
-                answer = QMessageBox.question(self, "시험 실행", "LTX Trial은 복원을 수행하지 않습니다. 실행하시겠습니까?")
-                if answer != QMessageBox.StandardButton.Yes:
-                    return
-            executable = Path(opts.executable)
-            if not executable.is_file() and shutil.which(opts.executable) is None:
-                raise ValueError("Jasna 실행 파일을 찾지 못했습니다. 공식 배포본의 jasna.exe 경로를 선택하세요.")
+            opts = self.options()
             planned = plan_queue(self.queue, opts)
             save_settings(opts, self.queue.items())
-        except (OSError, ValueError) as exc:
-            QMessageBox.warning(self, "실행 전 검사 실패", str(exc))
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "실행 전 검증", str(exc))
             return
-        self._planned = planned
-        self.model.reset_statuses()
+        self.busy = True
+        self.start.setEnabled(False)
+        self.cancel.setEnabled(True)
+        self.table.setEnabled(False)
         self.progress.setValue(0)
-        self._set_busy(True)
-        thread = QThread(self)
-        worker = RunWorker(planned)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.execute)
-        worker.update.connect(self._update)
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._finished)
-        thread.finished.connect(thread.deleteLater)
-        self._thread, self._worker = thread, worker
-        self._log(f"대기열 실행: 총 {len(planned)}개 · GPU cuda:{opts.gpu_index}")
-        thread.start()
+        self.model.states.clear()
+        self.model.refresh()
+        self.thread = QThread(self)
+        self.worker = Worker(planned, opts)
+        self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.execute)
+        self.worker.update.connect(self.update_status)
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.thread.finished.connect(self.run_finished)
+        self.thread.finished.connect(self.thread.deleteLater)
+        self.thread.start()
 
     @Slot(object)
-    def _update(self, event: Update):
-        if event.kind == "all_done":
-            self._log(event.message)
-            return
-        if event.index >= 0:
-            status = {"started": "실행 중", "completed": "완료", "failed": "실패", "stopped": "중지"}.get(event.kind)
-            if status:
-                self.model.set_state(event.index, status)
-            if event.kind == "started":
-                self.progress.setValue(0)
-            elif event.kind == "progress":
-                self.progress.setValue(max(0, min(100, round(event.percent))))
-            elif event.kind == "completed":
-                self.progress.setValue(100)
-            self.stage_label.setText(f"[{event.index + 1}/{len(self._planned)}] {status or event.message[:110]}")
-        if event.kind in ("log", "failed", "completed", "stopped") and event.message:
-            self._log(event.message)
+    def update_status(self, update: Update):
+        if update.kind in ("started", "completed", "failed", "stopped") and update.index >= 0:
+            self.model.set_state(update.index, {"started":"실행 중", "completed":"완료", "failed":"실패", "stopped":"중지"}[update.kind])
+        if update.kind == "progress":
+            if update.percent >= 0:
+                self.progress.setValue(max(0, min(100, round(update.percent))))
+            self.statusBar().showMessage(f"복원 처리 {update.fps:.1f} fps | {update.message}")
+        elif update.kind != "progress":
+            self.logs.appendPlainText(f"[{update.kind}] {update.message}")
 
     @Slot()
-    def _finished(self):
-        self._set_busy(False)
-        self._thread = None
-        self._worker = None
-        self._log("작업 스레드 종료")
+    def run_finished(self):
+        self.busy = False
+        self.start.setEnabled(True)
+        self.cancel.setEnabled(False)
+        self.table.setEnabled(True)
+        self.worker = None
+        self.thread = None
 
-    def _stop(self):
-        worker = self._worker
-        if worker:
-            self.stop_button.setEnabled(False)
-            self._log("작업 중단을 요청했습니다. 체크포인트 저장을 위해 인터럽트를 우선 보냅니다.")
-            worker.runner.request_stop()
+    def stop_jobs(self):
+        if self.worker:
+            self.cancel.setEnabled(False)
+            self.worker.runner.request_stop()
 
     def closeEvent(self, event):
-        if self._busy:
-            QMessageBox.information(self, "작업 실행 중", "작업 중지 후 종료하세요. 진행 상태가 저장될 수 있습니다.")
+        if self.busy:
+            QMessageBox.information(self, "처리 중", "작업을 중지한 후 종료하세요.")
             event.ignore()
             return
-        self.resources.stop()
-        self.resources.wait(3500)
         try:
-            save_settings(self._options(), self.queue.items())
-        except (OSError, ValueError):
+            save_settings(self.options(), self.queue.items())
+        except (ValueError, OSError):
             pass
         event.accept()
 
 
 def main() -> int:
     app = QApplication(sys.argv)
-    app.setApplicationName("LTX GUI")
-    app.setStyle("Fusion")
+    app.setApplicationName("LTX GUI — Independent")
     window = MainWindow()
     window.show()
     return app.exec()

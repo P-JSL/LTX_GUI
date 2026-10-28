@@ -1,4 +1,4 @@
-name: Test and build Windows GUI
+name: Test and build standalone Windows GUI
 on:
   push:
     branches: [main]
@@ -14,10 +14,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Run core and subprocess tests (no GPU required)
-        run: |
-          python -m pip install pytest
-          python -m pytest -q
+      - name: Install independent engine and tests
+        run: python -m pip install -e '.[test]'
+      - name: Tests
+        run: python -m pytest -q
   windows-build:
     needs: test
     runs-on: windows-latest
@@ -31,6 +31,6 @@ jobs:
         run: ./scripts/build_windows.ps1
       - uses: actions/upload-artifact@v4
         with:
-          name: LTX_GUI-Windows-x64
+          name: LTX_GUI-Independent-Windows-x64
           path: dist/LTX_GUI/
           if-no-files-found: error

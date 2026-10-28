@@ -4,21 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ltx-gui"
-version = "0.1.0"
-description = "Independent desktop job manager for licensed Jasna LTX restoration"
+version = "0.2.0"
+description = "Independent mask-guided video inpainting desktop application"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
+license-files = ["LICENSE"]
 authors = [{name = "LTX GUI contributors"}]
-dependencies = ["PySide6>=6.7,<7"]
+dependencies = ["PySide6>=6.7,<7", "numpy>=1.26,<3", "opencv-python-headless>=4.8,<5"]
 
 [project.optional-dependencies]
-monitoring = ["psutil>=5.9,<8"]
 test = ["pytest>=8,<10"]
 build = ["pyinstaller>=6,<7"]
 
 [project.scripts]
 ltx-gui = "ltx_gui.ui:main"
+ltx-restore = "ltx_gui.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["ltx_gui*"]

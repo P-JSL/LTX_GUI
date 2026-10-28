@@ -1,49 +1,53 @@
-"""Settings persistence without code execution or credential storage."""
+"""JSON preferences, independent of JASNA configuration and models."""
 from __future__ import annotations
 
 import json
 import os
 import tempfile
-from dataclasses import asdict, fields
+from dataclasses import asdict
 from pathlib import Path
 
-from .core import Job, Options
+from .core import Job, Options, Rectangle
 
 
-def settings_file() -> Path:
-    base = os.environ.get("APPDATA") or os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
-    return Path(base) / "LTX_GUI" / "settings.json"
-
-
-def load_settings(path: Path | None = None) -> tuple[Options, list[Job]]:
-    path = path or settings_file()
-    if not path.is_file():
-        return Options(), []
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        allowed = {f.name for f in fields(Options)}
-        opts = Options(**{k: v for k, v in data.get("options", {}).items() if k in allowed})
-        items = [Job(**{k: v for k, v in j.items() if k in {"input_path", "segments", "output_path"}})
-                 for j in data.get("jobs", []) if isinstance(j, dict)]
-        return opts, items
-    except (OSError, ValueError, TypeError, KeyError):
-        # Fail closed; malformed persisted configuration cannot run arbitrary code.
-        return Options(), []
+def settings_path() -> Path:
+    base = Path(os.environ.get("LOCALAPPDATA") or Path.home()/".config")
+    return base / "LTX_GUI" / "settings.json"
 
 
 def save_settings(options: Options, jobs: list[Job], path: Path | None = None) -> None:
-    path = path or settings_file()
+    path = path or settings_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps({"schema": 1, "options": asdict(options),
-                          "jobs": [asdict(job) for job in jobs]}, ensure_ascii=False, indent=2)
-    # Atomic replace prevents a crash from truncating a working configuration.
-    handle, temp_name = tempfile.mkstemp(prefix=".settings-", suffix=".tmp", dir=path.parent)
+    data = {"schema": 2, "options": asdict(options), "jobs": [asdict(j) for j in jobs]}
+    pending = None
     try:
-        with os.fdopen(handle, "w", encoding="utf-8") as fp:
-            fp.write(payload)
-            fp.flush()
-            os.fsync(fp.fileno())
-        os.replace(temp_name, path)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=".settings_", suffix=".tmp", delete=False) as f:
+            pending = Path(f.name)
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(pending, path)
     finally:
-        if os.path.exists(temp_name):
-            os.unlink(temp_name)
+        if pending:
+            pending.unlink(missing_ok=True)
+
+
+def load_settings(path: Path | None = None) -> tuple[Options, list[Job]]:
+    path = path or settings_path()
+    if not path.exists():
+        return Options(), []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if data.get("schema") != 2:
+        # Old CLI-specific settings are intentionally not interpreted as native settings.
+        return Options(), []
+    opts = Options(**{k: v for k, v in data.get("options", {}).items()
+                      if k in Options.__dataclass_fields__})
+    opts.validate()
+    jobs = []
+    for item in data.get("jobs", []):
+        region = item.get("rectangle")
+        rect = Rectangle(**region) if isinstance(region, dict) else None
+        jobs.append(Job(input_path=item["input_path"], rectangle=rect,
+                        mask_path=item.get("mask_path", ""), output_path=item.get("output_path", "")))
+    return opts, jobs

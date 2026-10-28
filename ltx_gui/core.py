@@ -1,49 +1,78 @@
-"""Independent job planning and validation; never imports a GPU framework.
-
-Jasna is a separately installed, licensed runtime. No Jasna code or models are
-included in this application.
-"""
+"""Pure, independently authored job planning for an in-process video restoration engine."""
 from __future__ import annotations
 
-import hashlib
 import os
-import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable
 
-VIDEO_EXTENSIONS = frozenset({".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".ts"})
-QUALITY_MODELS = {
-    "Standard": "ltx", "Good": "ltx-4step",
-    "High": "ltx-8step", "Top": "ltx-undistilled",
-    "BasicVSR++": "basicvsrpp",
-}
-TIME_PATTERN = re.compile(r"^(?:(\d+):)?(\d+):(\d{2}(?:\.\d{1,3})?)$|^(\d+(?:\.\d{1,3})?)$")
-SEGMENT_PATTERN = re.compile(r"^([^,\-]+)-([^,\-]+)$")
+VIDEO_EXTENSIONS = frozenset({".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"})
+METHODS = ("fast", "temporal")
+ENCODERS = ("libx264", "h264_nvenc")
+
+
+@dataclass(frozen=True)
+class Rectangle:
+    """Normalized rectangle: 0 <= left < right <= 1, likewise top/bottom."""
+    left: float
+    top: float
+    right: float
+    bottom: float
+
+    def validate(self) -> None:
+        if not (0 <= self.left < self.right <= 1 and 0 <= self.top < self.bottom <= 1):
+            raise ValueError("영역 좌표는 0~1 범위에서 좌측<우측, 상단<하단이어야 합니다.")
+
+    def pixels(self, width: int, height: int) -> tuple[int, int, int, int]:
+        self.validate()
+        import math
+        return (math.floor(self.left * width), math.floor(self.top * height),
+                math.ceil(self.right * width), math.ceil(self.bottom * height))
+
+    @classmethod
+    def parse(cls, value: str) -> Rectangle:
+        values = [part.strip() for part in value.split(",")]
+        if len(values) != 4:
+            raise ValueError("영역은 x1,y1,x2,y2 형식이며 값은 0~1입니다.")
+        try:
+            obj = cls(*(float(item) for item in values))
+        except ValueError as exc:
+            raise ValueError("영역 좌표는 숫자 네 개여야 합니다.") from exc
+        obj.validate()
+        return obj
+
+    def as_text(self) -> str:
+        return ",".join(f"{v:.5f}" for v in (self.left, self.top, self.right, self.bottom))
 
 
 @dataclass(frozen=True)
 class Options:
-    executable: str = "jasna"
     output_dir: str = ""
-    quality: str = "Standard"
-    gpu_index: int = 0
-    codec: str = "hevc"
-    seed: int = 20260923
-    fast: bool = False
-    large_canvas: bool = False
-    less_overlap: bool = True
-    trial: bool = False
-    auto_split_percent: int = 0
-    basic_clip_size: int = 90
-    basic_overlap: int = 8
-    cq: int | None = None
+    method: str = "fast"
+    encoder: str = "libx264"
+    radius: int = 3
+    temporal_weight: float = 0.35
+    flow_scale: float = 0.5
+    ffmpeg: str = "ffmpeg"
+
+    def validate(self) -> None:
+        if self.method not in METHODS or self.encoder not in ENCODERS:
+            raise ValueError("지원하지 않는 복원 모드 또는 인코더입니다.")
+        if not 1 <= self.radius <= 20:
+            raise ValueError("복원 반경은 1~20이어야 합니다.")
+        if not 0 <= self.temporal_weight <= 0.8:
+            raise ValueError("시간축 합성 강도는 0~0.8이어야 합니다.")
+        if not 0.125 <= self.flow_scale <= 1:
+            raise ValueError("Optical Flow 해상도 배율은 0.125~1이어야 합니다.")
+        if not self.ffmpeg.strip():
+            raise ValueError("FFmpeg 실행 파일 경로가 필요합니다.")
 
 
 @dataclass(frozen=True)
 class Job:
     input_path: str
-    segments: str = ""
+    rectangle: Rectangle | None = None
+    mask_path: str = ""
     output_path: str = ""
 
 
@@ -52,208 +81,91 @@ class PlannedJob:
     job: Job
     source: Path
     target: Path
-    command: tuple[str, ...]
+    mask_path: Path | None
 
 
-def parse_time(raw: str) -> float:
-    """Parse s, mm:ss, hh:mm:ss. Returns seconds; rejects negative/NaN."""
-    raw = raw.strip()
-    match = TIME_PATTERN.fullmatch(raw)
-    if not match:
-        raise ValueError(f"잘못된 시간 형식: {raw!r}")
-    if match.group(4) is not None:
-        return float(match.group(4))
-    if match.group(1) is None:
-        minutes, seconds = int(match.group(2)), float(match.group(3))
-        if seconds >= 60:
-            raise ValueError("초는 60 미만이어야 합니다.")
-        return minutes * 60 + seconds
-    hours, minutes, seconds = int(match.group(1)), int(match.group(2)), float(match.group(3))
-    if minutes >= 60 or seconds >= 60:
-        raise ValueError("분과 초는 60 미만이어야 합니다.")
-    return hours * 3600 + minutes * 60 + seconds
+def normalize_path(value: str) -> Path:
+    return Path(value).expanduser().resolve()
 
 
-def validate_segments(segments: str) -> str:
-    """Validate non-overlapping ascending intervals without changing Jasna syntax."""
-    if not segments.strip():
-        return ""
-    normalized = []
-    previous_end = -1.0
-    for entry in segments.split(","):
-        match = SEGMENT_PATTERN.fullmatch(entry.strip())
-        if not match:
-            raise ValueError("구간은 '시작-종료,시작-종료' 형태로 입력하세요.")
-        start, end = parse_time(match.group(1)), parse_time(match.group(2))
-        if start >= end:
-            raise ValueError("복원 구간 종료 시간은 시작 시간보다 커야 합니다.")
-        if start < previous_end:
-            raise ValueError("복원 구간은 시작 시간순이며 서로 겹칠 수 없습니다.")
-        normalized.append(f"{match.group(1).strip()}-{match.group(2).strip()}")
-        previous_end = end
-    return ",".join(normalized)
-
-
-def resolve_path(path: str) -> Path:
-    return Path(path).expanduser().resolve()
-
-
-def target_path(job: Job, options: Options) -> Path:
-    src = resolve_path(job.input_path)
-    if job.output_path.strip():
-        return resolve_path(job.output_path)
-    directory = resolve_path(options.output_dir) if options.output_dir.strip() else src.parent
-    return directory / f"{src.stem}_ltx.mkv"
-
-
-def validate_options(options: Options) -> None:
-    if not options.executable.strip():
-        raise ValueError("Jasna 실행 파일 경로가 비어 있습니다.")
-    if options.quality not in QUALITY_MODELS:
-        raise ValueError(f"지원하지 않는 품질: {options.quality}")
-    if options.gpu_index < 0 or options.gpu_index > 63:
-        raise ValueError("GPU 번호는 0~63 범위여야 합니다.")
-    if options.codec not in ("h264", "hevc", "av1"):
-        raise ValueError("인코딩 코덱을 확인하세요.")
-    if not 0 <= options.seed < 2**63:
-        raise ValueError("시드는 0 이상, 2^63 미만이어야 합니다.")
-    if options.auto_split_percent and not 1 <= options.auto_split_percent <= 100:
-        raise ValueError("자동 분할 임계값은 1~100%입니다.")
-    if not 2 <= options.basic_clip_size <= 10000:
-        raise ValueError("클립 길이는 2~10000 프레임이어야 합니다.")
-    if not 0 <= options.basic_overlap * 2 < options.basic_clip_size:
-        raise ValueError("겹치는 프레임은 클립 길이의 절반보다 작아야 합니다.")
-    if options.cq is not None and not 0 <= options.cq <= 63:
-        raise ValueError("CQ는 0~63 범위여야 합니다. (코덱/하드웨어별 제한 별도 확인)")
+def path_key(path: Path) -> str:
+    # Windows is case-insensitive regardless of the OS running CI tests.
+    value = str(path.resolve())
+    return value.casefold() if os.name == "nt" else value
 
 
 def plan_job(job: Job, options: Options) -> PlannedJob:
-    validate_options(options)
-    src = resolve_path(job.input_path)
-    if not src.is_file():
-        raise ValueError(f"입력 파일이 존재하지 않습니다: {src}")
-    if src.suffix.lower() not in VIDEO_EXTENSIONS:
-        raise ValueError(f"지원하지 않는 영상 확장자: {src.suffix}")
-    dst = target_path(job, options)
-    if dst == src:
-        raise ValueError("입력 파일과 출력 파일이 같습니다.")
-    if dst.suffix.lower() not in VIDEO_EXTENSIONS:
-        raise ValueError("출력 파일은 영상 확장자를 가져야 합니다.")
-    if dst.exists():
-        raise FileExistsError(f"기존 출력 파일을 덮어쓸 수 없습니다: {dst}")
-    segments = validate_segments(job.segments)
-    if segments and options.auto_split_percent and options.quality != "BasicVSR++":
-        raise ValueError("개별 구간과 LTX 자동 분할 기능은 동시에 사용할 수 없습니다.")
-    if segments and options.codec != "hevc":
-        # With --segments Jasna always preserves the input codec, not an explicitly
-        # chosen output codec. We therefore omit --codec in this mode altogether.
-        pass
-    # One folder per input/target pair: avoids unrelated jobs sharing resume state.
-    tag = hashlib.sha256((str(src) + "\0" + str(dst)).encode("utf-8")).hexdigest()[:16]
-    working = dst.parent / ".ltx_gui_work" / tag
-    command = [options.executable, "--input", str(src), "--output", str(dst),
-               "--device", f"cuda:{options.gpu_index}",
-               "--restoration-model-name", QUALITY_MODELS[options.quality],
-               "--working-directory", str(working), "--log-level", "info"]
-    if not segments:
-        command += ["--codec", options.codec]
-        if options.cq is not None:
-            command += ["--cq", str(options.cq)]
-    if segments:
-        command += ["--segments", segments]
-    if options.quality == "BasicVSR++":
-        command += ["--max-clip-size", str(options.basic_clip_size),
-                    "--temporal-overlap", str(options.basic_overlap)]
-    else:
-        command += ["--ltx-seed", str(options.seed)]
-        if options.fast:
-            command.append("--ltx-fast")
-        if options.large_canvas:
-            command.append("--ltx-large-canvas")
-        if not options.less_overlap:
-            command.append("--no-experimental-ltx-less-overlap")
-        if options.trial:
-            command.append("--ltx-trial")
-        if options.auto_split_percent:
-            command += ["--ltx-auto-split", str(options.auto_split_percent)]
-    return PlannedJob(job, src, dst, tuple(command))
+    options.validate()
+    source = normalize_path(job.input_path)
+    if not source.is_file() or source.suffix.lower() not in VIDEO_EXTENSIONS:
+        raise ValueError(f"영상 파일이 없거나 확장자를 지원하지 않습니다: {source}")
+    if (job.rectangle is None) == (not bool(job.mask_path.strip())):
+        raise ValueError("마스크 이미지 또는 사각형 중 정확히 하나를 지정해야 합니다.")
+    if job.rectangle:
+        job.rectangle.validate()
+    mask = normalize_path(job.mask_path) if job.mask_path.strip() else None
+    if mask and (not mask.is_file() or mask.suffix.lower() not in (".png", ".bmp", ".jpg", ".jpeg")):
+        raise ValueError(f"마스크 이미지 파일을 확인하세요: {mask}")
+    folder = normalize_path(options.output_dir) if options.output_dir.strip() else source.parent
+    target = normalize_path(job.output_path) if job.output_path.strip() else folder / f"{source.stem}_restored.mkv"
+    if target.suffix.lower() not in (".mkv", ".mp4"):
+        raise ValueError("출력 파일은 .mkv 또는 .mp4만 지원합니다.")
+    if path_key(target) == path_key(source):
+        raise ValueError("입력 파일은 덮어쓸 수 없습니다.")
+    if target.exists():
+        raise FileExistsError(f"출력 파일이 이미 존재합니다: {target}")
+    return PlannedJob(job, source, target, mask)
 
 
 def plan_queue(jobs: Iterable[Job], options: Options) -> list[PlannedJob]:
-    """O(n) planning, O(1) average-case duplicate-output detection."""
-    result = []
-    occupied: set[str] = set()
+    planned: list[PlannedJob] = []
+    targets: set[str] = set()
     for job in jobs:
-        planned = plan_job(job, options)
-        key = os.path.normcase(str(planned.target))
-        if key in occupied:
-            raise ValueError(f"출력 파일명이 중복되었습니다: {planned.target.name}")
-        occupied.add(key)
-        result.append(planned)
-    return result
+        entry = plan_job(job, options)
+        key = path_key(entry.target)
+        if key in targets:
+            raise ValueError(f"출력 대상 중복: {entry.target}")
+        targets.add(key)
+        planned.append(entry)
+    return planned
 
 
 class JobQueue:
-    """Insertion-ordered queue: O(1) random read, amortized O(1) append and membership.
-
-    Arbitrary deletion remains O(n), which is optimal for compact array storage.
-    """
-
+    """Order-preserving list + hash membership (amortized O(1) add/lookup)."""
     def __init__(self, jobs: Iterable[Job] = ()) -> None:
-        self._queue: list[Job] = []
-        self._known: set[str] = set()
+        self._items: list[Job] = []
+        self._keys: set[str] = set()
         for job in jobs:
             self.add(job)
 
     def add(self, job: Job) -> bool:
-        key = os.path.normcase(str(resolve_path(job.input_path)))
-        if key in self._known:
+        key = path_key(normalize_path(job.input_path))
+        if key in self._keys:
             return False
-        self._known.add(key)
-        self._queue.append(job)
+        self._keys.add(key)
+        self._items.append(job)
         return True
 
-    def contains(self, input_path: str) -> bool:
-        return os.path.normcase(str(resolve_path(input_path))) in self._known
-
-    def __getitem__(self, index: int) -> Job:
-        return self._queue[index]
-
-    def update_at(self, index: int, *, segments: str) -> None:
-        self._queue[index] = Job(self._queue[index].input_path, segments, self._queue[index].output_path)
-
     def remove_at(self, index: int) -> Job:
-        # Arbitrary removal O(n), but constant-time membership and FIFO operations.
-        if index < 0 or index >= len(self._queue):
-            raise IndexError(index)
-        job = self._queue[index]
-        del self._queue[index]
-        self._known.remove(os.path.normcase(str(resolve_path(job.input_path))))
-        return job
+        item = self._items.pop(index)
+        self._keys.remove(path_key(normalize_path(item.input_path)))
+        return item
+
+    def update_at(self, index: int, **fields: object) -> None:
+        self._items[index] = replace(self._items[index], **fields)
 
     def clear(self) -> None:
-        self._queue.clear()
-        self._known.clear()
-
-    def __len__(self) -> int:
-        return len(self._queue)
-
-    def __iter__(self):
-        return iter(self._queue)
+        self._items.clear()
+        self._keys.clear()
 
     def items(self) -> list[Job]:
-        return list(self._queue)
+        return self._items.copy()
 
+    def __len__(self) -> int:
+        return len(self._items)
 
-def estimated_windows(frames: int, window: int = 121, hop: int = 104) -> int:
-    """Minimal fixed-size overlapping windows to cover N frames, O(1) arithmetic.
+    def __getitem__(self, index: int) -> Job:
+        return self._items[index]
 
-    This models *one* continuous track only; actual tracking can yield more.
-    """
-    if frames < 0 or window <= 0 or not 0 < hop <= window:
-        raise ValueError("잘못된 프레임/윈도 파라미터입니다.")
-    if frames == 0:
-        return 0
-    if frames <= window:
-        return 1
-    return 1 + (frames - window + hop - 1) // hop
+    def __iter__(self):
+        return iter(self._items)
