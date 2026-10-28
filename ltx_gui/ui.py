@@ -8,7 +8,7 @@ import cv2
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, QPoint, QRect, Qt, QThread, Signal, Slot
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QFileDialog, QFormLayout, QGridLayout,
+    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QGridLayout,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
     QPlainTextEdit, QProgressBar, QPushButton, QDoubleSpinBox, QSpinBox,
     QTableView, QVBoxLayout, QWidget,
@@ -230,7 +230,8 @@ class MainWindow(QMainWindow):
         self.method = QComboBox()
         self.method.addItem("빠른 공간 인페인팅 (Telea)", "fast")
         self.method.addItem("시간축 Optical Flow + Telea", "temporal")
-        self.method.setCurrentIndex(0 if opts.method == "fast" else 1)
+        self.method.addItem("독립 학습 신경망 (DiT + VAE)", "neural")
+        self.method.setCurrentIndex({"fast": 0, "temporal": 1, "neural": 2}[opts.method])
         self.encoder = QComboBox()
         self.encoder.addItem("CPU H.264 (libx264)", "libx264")
         self.encoder.addItem("NVIDIA GPU 인코딩 (NVENC)", "h264_nvenc")
@@ -264,6 +265,32 @@ class MainWindow(QMainWindow):
         self.detector_confidence.setValue(opts.detector_confidence)
         controls.addWidget(QLabel("탐지 신뢰도"), 6, 0)
         controls.addWidget(self.detector_confidence, 6, 1)
+        self.native_checkpoint = QLineEdit(opts.checkpoint_path)
+        self.native_checkpoint.setPlaceholderText("직접 학습한 LTX_GUI .pt 체크포인트")
+        choose_checkpoint = QPushButton("찾기")
+        choose_checkpoint.clicked.connect(self.choose_checkpoint)
+        controls.addWidget(QLabel("독립 모델 체크포인트"), 7, 0)
+        controls.addWidget(self.native_checkpoint, 7, 1)
+        controls.addWidget(choose_checkpoint, 7, 2)
+        self.native_device = QComboBox()
+        self.native_device.addItems(["cpu", "cuda", "cuda:0", "cuda:1"])
+        self.native_device.setEditable(True)
+        self.native_device.setCurrentText(opts.neural_device)
+        self.native_steps = QSpinBox()
+        self.native_steps.setRange(1, 1000)
+        self.native_steps.setValue(opts.neural_steps)
+        self.native_frames = QComboBox()
+        self.native_frames.addItems([str(x) for x in range(9, 130, 8)])
+        self.native_frames.setCurrentText(str(opts.neural_clip_frames))
+        self.native_compile = QCheckBox("CUDA 컴파일(첫 실행 지연)")
+        self.native_compile.setChecked(opts.neural_compile)
+        neural_controls = QHBoxLayout()
+        for label, control in (("장치", self.native_device), ("추론 단계", self.native_steps),
+                               ("클립 프레임", self.native_frames)):
+            neural_controls.addWidget(QLabel(label))
+            neural_controls.addWidget(control)
+        neural_controls.addWidget(self.native_compile)
+        controls.addLayout(neural_controls, 8, 0, 1, 3)
         advanced = QHBoxLayout()
         for title, widget in (("공간 반경", self.radius), ("Temporal 가중치", self.weight), ("Flow 배율", self.flow)):
             advanced.addWidget(QLabel(title))
@@ -288,7 +315,7 @@ class MainWindow(QMainWindow):
         self.logs.setReadOnly(True)
         self.logs.setMaximumBlockCount(1500)
         layout.addWidget(self.logs)
-        self.statusBar().showMessage("독립 CPU 복원 파이프라인. GPU는 NVENC 인코딩에서만 사용합니다.")
+        self.statusBar().showMessage("공간/시간축 고전 복원 또는 자체 학습된 DiT/VAE 추론. 학습 체크포인트 필요.")
 
     def selected_row(self):
         idx = self.table.selectionModel().selectedRows()
@@ -358,13 +385,23 @@ class MainWindow(QMainWindow):
         if path:
             self.detector_model.setText(path)
 
+    def choose_checkpoint(self):
+        path, _ = QFileDialog.getOpenFileName(self, "학습된 독립 모델 선택", "", "PyTorch checkpoint (*.pt)")
+        if path:
+            self.native_checkpoint.setText(path)
+
     def options(self):
         return Options(output_dir=self.output.text().strip(), method=self.method.currentData(),
                        encoder=self.encoder.currentData(), radius=self.radius.value(),
                        temporal_weight=self.weight.value(), flow_scale=self.flow.value(),
                        ffmpeg=self.ffmpeg.text().strip(),
                        detector_model=self.detector_model.text().strip(),
-                       detector_confidence=self.detector_confidence.value())
+                       detector_confidence=self.detector_confidence.value(),
+                       checkpoint_path=self.native_checkpoint.text().strip(),
+                       neural_device=self.native_device.currentText().strip(),
+                       neural_steps=self.native_steps.value(),
+                       neural_clip_frames=int(self.native_frames.currentText()),
+                       neural_compile=self.native_compile.isChecked())
 
     def persist(self):
         try:

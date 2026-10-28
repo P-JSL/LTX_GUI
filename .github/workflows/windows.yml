@@ -4,6 +4,12 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      native:
+        description: "Build optional large PyTorch-native Windows executable"
+        type: boolean
+        required: false
+        default: false
 permissions:
   contents: read
 jobs:
@@ -14,6 +20,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Install CPU PyTorch for native neural regression tests
+        run: python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.7'
       - name: Install independent engine and tests
         run: python -m pip install -e '.[test]'
       - name: Tests
@@ -32,5 +40,23 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: LTX_GUI-Independent-Windows-x64
+          path: dist/LTX_GUI/
+          if-no-files-found: error
+
+  windows-native-build:
+    if: github.event_name == 'workflow_dispatch' && inputs.native
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build native-enabled (PyTorch bundled)
+        shell: pwsh
+        run: ./scripts/build_windows.ps1 -IncludeNative
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LTX_GUI-Native-PyTorch-Windows-x64
           path: dist/LTX_GUI/
           if-no-files-found: error

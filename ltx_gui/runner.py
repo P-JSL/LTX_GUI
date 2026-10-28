@@ -36,7 +36,11 @@ class BatchRunner:
                 def report(p: Progress) -> None:
                     percent = (100 * p.frames / p.total) if p.total else -1
                     self._on_update(Update(index, "progress", f"{p.frames}/{p.total} frame", percent, p.fps))
-                result = restore_video(job, self._options, self._stop, report)
+                if self._options.method == "neural":
+                    from .native_engine import restore_native_video
+                    result = restore_native_video(job, self._options, self._stop, report)
+                else:
+                    result = restore_video(job, self._options, self._stop, report)
                 self._on_update(Update(index, "completed", str(result), 100))
             except Cancelled as exc:
                 self._on_update(Update(index, "stopped", str(exc)))

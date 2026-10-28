@@ -1,4 +1,4 @@
-# LTX GUI — Independent Restoration Engine (v0.3.0)
+# LTX GUI — Independent Restoration Engine (v0.4.0)
 
 **JASNA를 실행·연동·복사하지 않는 독립 Windows GUI 영상 인페인팅 응용프로그램입니다.**
 Python/PySide6 UI + OpenCV(C++ 내부 최적화 연산) + 별도 설치된 FFmpeg를 사용합니다.
@@ -7,6 +7,49 @@ Python/PySide6 UI + OpenCV(C++ 내부 최적화 연산) + 별도 설치된 FFmpe
 > ⚠️ 기본 GUI 복원은 **고전적 공간·시간축 인페인팅**입니다. 별도 LTX-2.5 생성형 CLI는 공식 학습 가중치가 있을 때만 동작합니다. 고전적 공간·시간축
 > 인페인팅으로 선택 영역을 근사 복원하는 실동작 버전입니다. 큰 면적·복잡한 원본 콘텐츠를
 > 재구성하거나 기존에 사라진 픽셀을 진짜 원본으로 되찾을 수는 없습니다.
+
+
+## v0.4.0 — 독립 신경망 실행 및 병목 개선
+
+**기존 고전적 복원 모드는 변경하지 않았습니다.** 새 GUI의 `독립 학습 신경망
+(DiT + VAE)` 옵션을 선택하면 `ltx-core`, `ltx-pipelines`, `JASNA`를 호출하지
+않고 이 저장소의 `ltx_gui/neural/` 모델을 실행합니다.
+
+- Conv VAE + Rectified Flow DiT + 3D RoPE + 학습 가능한 *causal temporal*
+  depthwise 필터(훈련 때 옵션 지정).
+- `scaled_dot_product_attention`, 선택적 CUDA `torch.compile` **동일 모델에
+  대해 1회 컴파일**, 고정 3D 윈도 어텐션으로 token pair O(N²) → O(N×K).
+- 8k+1 영상 윈도/1프레임 문맥 중첩, 전체 비디오 버퍼링 없이 FFmpeg 출력 및
+  오디오 remux, 빈 마스크의 GPU 추론 생략, 출력 덮어쓰기 방지.
+- GUI와 `ltx-restore --method neural`, `ltx-train-native` 경로에서 이용 가능.
+
+**필수 제약:** 자체 모델은 연구용으로 경량화하여 공식 **LTX-2.5 22B
+Transformer/VAE와 가중치가 호환되지 않습니다.** 공식 가중치로 실행되지
+않으며, 학습된 자체 체크포인트를 준비해야 합니다. 학습되지 않은 모델은
+의미 있는 복원 품질을 제공하지 않습니다. CUDA 성능·실제 품질은 미검증입니다.
+
+학습 데이터 형식: 작은 데이터는 `.npz`, 대용량은 메모리 매핑 가능한
+`videos.npy`·`masks.npy`를 담은 폴더입니다. `videos` = `[N,T,H,W,3] uint8`,
+`masks` = `[N,T,H,W] uint8`; 올바른 복원 레이블을 가진 적법한 데이터가 필요합니다.
+
+```shell
+python -m pip install -e ".[native,test]"
+ltx-train-native train.npz --output checkpoints/native.pt --vae-steps 1000 --flow-steps 1000 --device cuda --causal-temporal
+ltx-restore input.mp4 --rectangle 0.20,0.20,0.70,0.70 --method neural --checkpoint checkpoints/native.pt --device cuda --steps 8 --clip-frames 9
+python -m scripts.bench_neural_attention --device cpu --iterations 15
+```
+
+`1000`단계는 단지 CLI 실행 예이며 충분한 훈련이라고 보장하지 않습니다.
+CUDA가 없는 환경에서는 `--device cpu`를 사용하고, 전용 모델은 작은
+테스트 클립에서 검증한 뒤 전체 영상에 사용하세요. 8k+1 이상의 클립 길이는
+GPU 메모리와 품질을 고려해 직접 선택합니다.
+
+윈도 attention의 지역성 때문에 장거리 연속성은 기존 global attention보다
+낮을 수 있습니다. 컴파일·윈도 길이·FPS/화질 측정은 동일 체크포인트와
+마스크 조건에서 평가해야 합니다.
+
+[타 저장소 비교/라이선스](docs/EXTERNAL_REPOSITORIES.md) ·
+[성능/복잡도 분석](docs/PERFORMANCE.md)
 
 ## 기능
 - 네이티브 GUI에서 다수의 영상 파일·폴더 입력, 파일당 한 개 사각형 영역 선택 또는 마스크 이미지 지정
@@ -33,8 +76,8 @@ python -m ltx_gui.cli "C:\videos\in.mp4" --rectangle 0.25,0.25,0.75,0.75 --metho
 python -m ltx_gui.cli in.mp4 --mask mask.png --encoder libx264
 ```
 
-GPU NVENC는 영상 **인코딩**에만 사용합니다. `--encoder h264_nvenc`를 선택하려면
-FFmpeg가 해당 인코더와 NVIDIA 드라이버를 지원해야 합니다. GPU 복원 추론 자체는 없습니다.
+기본 고전적 복원 모드에서 GPU NVENC는 영상 **인코딩**에만 사용합니다. `--encoder h264_nvenc`를 선택하려면
+FFmpeg가 해당 인코더와 NVIDIA 드라이버를 지원해야 합니다. 독립 신경망 모드에서는 적절히 학습된 체크포인트와 CUDA가 있을 때 PyTorch GPU 추론을 사용합니다.
 
 GUI 빌드: `powershell -ExecutionPolicy Bypass -File scripts/build_windows.ps1`.
 GitHub Actions의 Windows ZIP 아티팩트에는 Python 패키지가 묶이며 `ffmpeg.exe`는 포함되지 않습니다.

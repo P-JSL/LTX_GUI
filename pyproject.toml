@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ltx-gui"
-version = "0.3.0"
+version = "0.4.0"
 description = "Independent mask-guided video inpainting desktop application"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -14,7 +14,8 @@ authors = [{name = "LTX GUI contributors"}]
 dependencies = ["PySide6>=6.7,<7", "numpy>=1.26,<3", "opencv-python-headless>=4.8,<5"]
 
 [project.optional-dependencies]
-test = ["pytest>=8,<10"]
+test = ["pytest>=8,<10", "torch>=2.7"]
+native = ["torch>=2.7"]
 gpu = ["torch>=2.7", "safetensors>=0.5"]
 detector = ["onnxruntime>=1.20"]
 ltx = ["torch>=2.7", "safetensors>=0.5"]  # ltx-core/ltx-pipelines: install per upstream exact version/driver instructions
@@ -24,6 +25,7 @@ build = ["pyinstaller>=6,<7"]
 ltx-gui = "ltx_gui.ui:main"
 ltx-restore = "ltx_gui.cli:main"
 ltx-retake = "ltx_gui.ltx_retake_cli:main"
+ltx-train-native = "ltx_gui.neural.train_cli:main"
 
 [tool.setuptools.packages.find]
 include = ["ltx_gui*"]

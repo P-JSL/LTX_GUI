@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Iterable
 
 VIDEO_EXTENSIONS = frozenset({".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"})
-METHODS = ("fast", "temporal")
+METHODS = ("fast", "temporal", "neural")
 ENCODERS = ("libx264", "h264_nvenc")
 
 
@@ -63,6 +63,11 @@ class Options:
     tracker_iou: float = 0.20
     tracker_gap: int = 2
     tracker_padding: int = 3
+    checkpoint_path: str = ""
+    neural_device: str = "cpu"
+    neural_steps: int = 8
+    neural_clip_frames: int = 9
+    neural_compile: bool = False
 
     def validate(self) -> None:
         if self.method not in METHODS or self.encoder not in ENCODERS:
@@ -81,6 +86,12 @@ class Options:
             raise ValueError("탐지 해상도는 32의 배수여야 합니다.")
         if not 0 <= self.tracker_iou < 1 or not 0 <= self.tracker_gap <= 120 or not 0 <= self.tracker_padding <= 256:
             raise ValueError("추적기 설정 범위가 올바르지 않습니다.")
+        if self.neural_device != "cpu" and not (self.neural_device == "cuda" or (self.neural_device.startswith("cuda:") and self.neural_device[5:].isdigit())):
+            raise ValueError("GPU 장치는 cpu 또는 cuda[:index] 형식이어야 합니다.")
+        if not 1 <= self.neural_steps <= 1000:
+            raise ValueError("확산 단계는 1~1000 사이여야 합니다.")
+        if not 9 <= self.neural_clip_frames <= 129 or (self.neural_clip_frames-1) % 8:
+            raise ValueError("신경망 클립은 9,17,...,129 프레임만 지원합니다.")
         if not self.ffmpeg.strip():
             raise ValueError("FFmpeg 실행 파일 경로가 필요합니다.")
 
@@ -120,6 +131,8 @@ def plan_job(job: Job, options: Options) -> PlannedJob:
     selected_modes = int(job.rectangle is not None) + int(bool(job.mask_path.strip())) + int(job.auto_detect)
     if selected_modes != 1:
         raise ValueError("마스크 이미지, 사각형 또는 자동 탐지 중 하나를 지정해야 합니다.")
+    if options.method == "neural" and not Path(options.checkpoint_path).is_file():
+        raise FileNotFoundError("독립 신경망의 학습된 .pt 체크포인트를 지정해야 합니다.")
     if job.auto_detect and not Path(options.detector_model).is_file():
         raise FileNotFoundError("자동 탐지를 위한 학습된 ONNX 모델 파일을 지정해야 합니다.")
     if job.rectangle:

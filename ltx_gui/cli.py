@@ -21,23 +21,36 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--detector-class", type=int, default=0)
     parser.add_argument("--detector-cuda", action="store_true")
     parser.add_argument("--output", default="", help="Output .mkv/.mp4, defaults next to source")
-    parser.add_argument("--method", choices=("fast", "temporal"), default="fast")
+    parser.add_argument("--method", choices=("fast", "temporal", "neural"), default="fast")
     parser.add_argument("--encoder", choices=("libx264", "h264_nvenc"), default="libx264")
     parser.add_argument("--radius", type=int, default=3)
     parser.add_argument("--weight", type=float, default=0.35)
     parser.add_argument("--flow-scale", type=float, default=0.5)
     parser.add_argument("--ffmpeg", default="ffmpeg")
+    parser.add_argument("--checkpoint", default="", help="Trained local LTX_GUI .pt checkpoint for --method neural")
+    parser.add_argument("--device", default="cpu", help="cpu, cuda, cuda:0 etc.")
+    parser.add_argument("--steps", type=int, default=8, help="Native diffusion sampling steps")
+    parser.add_argument("--clip-frames", type=int, default=9, help="8k+1 frames, 9..129")
+    parser.add_argument("--compile-neural", action="store_true")
     ns = parser.parse_args(argv)
     options = Options(method=ns.method, encoder=ns.encoder, radius=ns.radius,
                       temporal_weight=ns.weight, flow_scale=ns.flow_scale, ffmpeg=ns.ffmpeg,
                       detector_model=ns.detector_model, detector_confidence=ns.detector_confidence,
                       detector_format=ns.detector_format, detector_class=ns.detector_class,
-                      detector_cuda=ns.detector_cuda)
+                      detector_cuda=ns.detector_cuda,
+                      checkpoint_path=ns.checkpoint, neural_device=ns.device,
+                      neural_steps=ns.steps, neural_clip_frames=ns.clip_frames,
+                      neural_compile=ns.compile_neural)
     job = Job(ns.input, rectangle=ns.rectangle, mask_path=ns.mask, output_path=ns.output,
               auto_detect=ns.auto_detect)
     try:
         planned = plan_job(job, options)
-        completed = restore_video(planned, options,
+        if ns.method == "neural":
+            from .native_engine import restore_native_video
+            processor = restore_native_video
+        else:
+            processor = restore_video
+        completed = processor(planned, options,
                                   progress=lambda p: print(f"\r{p.frames}/{p.total} frames - {p.fps:.1f} fps", end="", flush=True))
     except (ValueError, OSError, RuntimeError, Cancelled) as exc:
         print(f"\n오류: {exc}", file=sys.stderr)
