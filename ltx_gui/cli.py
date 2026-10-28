@@ -32,6 +32,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--steps", type=int, default=8, help="Native diffusion sampling steps")
     parser.add_argument("--clip-frames", type=int, default=9, help="8k+1 frames, 9..129")
     parser.add_argument("--compile-neural", action="store_true")
+    parser.add_argument("--gpu-backend", choices=("auto", "torch", "triton", "cuda"), default="auto")
+    parser.add_argument("--amp", choices=("none", "bf16", "fp16"), default="none")
     ns = parser.parse_args(argv)
     options = Options(method=ns.method, encoder=ns.encoder, radius=ns.radius,
                       temporal_weight=ns.weight, flow_scale=ns.flow_scale, ffmpeg=ns.ffmpeg,
@@ -40,7 +42,8 @@ def main(argv: list[str] | None = None) -> int:
                       detector_cuda=ns.detector_cuda,
                       checkpoint_path=ns.checkpoint, neural_device=ns.device,
                       neural_steps=ns.steps, neural_clip_frames=ns.clip_frames,
-                      neural_compile=ns.compile_neural)
+                      neural_compile=ns.compile_neural,
+                      neural_gpu_backend=ns.gpu_backend, neural_amp=ns.amp)
     job = Job(ns.input, rectangle=ns.rectangle, mask_path=ns.mask, output_path=ns.output,
               auto_detect=ns.auto_detect)
     try:

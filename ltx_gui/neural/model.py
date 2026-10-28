@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, asdict
+from collections import OrderedDict
 
 import torch
 from torch import nn, Tensor
@@ -178,8 +179,15 @@ class RMSNorm(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         self.gain = nn.Parameter(torch.ones(dim))
+        # Runtime-only toggle: never changes checkpoint parameter names/shapes.
+        self.gpu_backend = "torch"
 
     def forward(self, x: Tensor) -> Tensor:
+        if not self.training and not torch.is_grad_enabled() and self.gpu_backend in ("auto", "triton"):
+            from ..cuda_backend import fused_rmsnorm
+            # Preserve PyTorch mixed-precision promotion when gain is fp32.
+            if x.dtype == self.gain.dtype and x.is_contiguous() and self.gain.is_contiguous():
+                return fused_rmsnorm(x, self.gain, backend=self.gpu_backend)
         return (x * torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + 1e-6).to(x.dtype)) * self.gain
 
 
@@ -231,6 +239,9 @@ class VideoDiffusionTransformer(nn.Module):
         self.blocks = nn.ModuleList(AttentionBlock(d, config.heads) for _ in range(config.depth))
         self.norm = RMSNorm(d)
         self.velocity = nn.Linear(d, c)
+        # Small bounded cache for inference-only absolute 3D RoPE across steps.
+        # Never register as a parameter/buffer; checkpoint format is unchanged.
+        self._rope_cache = OrderedDict()
         # At initialization, velocity is zero, not arbitrary displacement.
         nn.init.zeros_(self.velocity.weight)
         nn.init.zeros_(self.velocity.bias)
@@ -243,7 +254,20 @@ class VideoDiffusionTransformer(nn.Module):
         b, _, t, h, w = noisy.shape
         z = self.input(torch.cat((noisy, known, mask.to(noisy.dtype)), dim=1))
         conditioning = self.time_proj(timestep_embedding(sigma, self.config.dim).to(z.dtype))
-        cos, sin, rotated = rope_positions(t, h, w, self.config.dim // self.config.heads, noisy.device)
+        key = (t, h, w, self.config.dim // self.config.heads, noisy.device)
+        compiling = getattr(torch.compiler, "is_compiling", lambda: False)()
+        if self.training or compiling:
+            cos, sin, rotated = rope_positions(t, h, w, key[3], noisy.device)
+        else:
+            cached = self._rope_cache.get(key)
+            if cached is None:
+                cached = rope_positions(t, h, w, key[3], noisy.device)
+                self._rope_cache[key] = cached
+                if len(self._rope_cache) > 4:
+                    self._rope_cache.popitem(last=False)
+            else:
+                self._rope_cache.move_to_end(key)
+            cos, sin, rotated = cached
         limits = (self.config.window_frames, self.config.window_side, self.config.window_side)
         if t <= limits[0] and h <= limits[1] and w <= limits[2]:
             # Exact global-attention path for tiny clips: no padding/copy overhead.
@@ -284,18 +308,27 @@ class LatentFlow(nn.Module):
 
     @torch.no_grad()
     def sample(self, clean: Tensor, mask: Tensor, *, steps: int = 8,
-               generator: torch.Generator | None = None) -> Tensor:
+               generator: torch.Generator | None = None,
+               gpu_backend: str = "auto", assume_nonempty: bool = False,
+               predictor=None) -> Tensor:
         if steps < 1 or steps > 1000:
             raise ValueError("Inference steps must be between 1 and 1000")
         if mask.shape != clean.shape[:1] + (1,) + clean.shape[2:]:
             raise ValueError("Latent mask size mismatch")
-        if torch.count_nonzero(mask) == 0:
+        if not assume_nonempty and torch.count_nonzero(mask) == 0:
             return clean.clone()
         known = clean * (1-mask)
         noise = torch.randn(clean.shape, device=clean.device, dtype=clean.dtype, generator=generator)
         z = noise * mask + known
+        from ..cuda_backend import masked_update
+        sigma_tensor = clean.new_empty((clean.shape[0],))
         for i in range(steps):
             sigma = 1-i/steps
-            velocity = self.net(z, known, mask, clean.new_full((clean.shape[0],), sigma))
-            z = (z - velocity / steps) * mask + known
+            velocity = (self.net if predictor is None else predictor)(z, known, mask, sigma_tensor.fill_(sigma))
+            # Under CUDA AMP, linear/conv kernels may return bf16/fp16 while
+            # mask arithmetic promotes the latent to fp32. Match the output
+            # dtype before a fused kernel (the pure torch path did this implicitly).
+            if velocity.dtype != z.dtype:
+                velocity = velocity.to(z.dtype)
+            z = masked_update(z, velocity, known, mask, 1.0 / steps, backend=gpu_backend)
         return z

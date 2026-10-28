@@ -1,4 +1,4 @@
-# LTX GUI — Independent Restoration Engine (v0.4.0)
+# LTX GUI — Independent Restoration Engine (v0.5.0)
 
 **JASNA를 실행·연동·복사하지 않는 독립 Windows GUI 영상 인페인팅 응용프로그램입니다.**
 Python/PySide6 UI + OpenCV(C++ 내부 최적화 연산) + 별도 설치된 FFmpeg를 사용합니다.
@@ -8,6 +8,31 @@ Python/PySide6 UI + OpenCV(C++ 내부 최적화 연산) + 별도 설치된 FFmpe
 > 인페인팅으로 선택 영역을 근사 복원하는 실동작 버전입니다. 큰 면적·복잡한 원본 콘텐츠를
 > 재구성하거나 기존에 사라진 픽셀을 진짜 원본으로 되찾을 수는 없습니다.
 
+
+## v0.5.0 — 독립 GPU 커널 구현 및 적용
+
+JASNA와 공식 LTX 추론 구성요소를 호출하지 않는 **자체 학습 경량 DiT/VAE**
+실행 경로에 CUDA C++(`cuda/fused_ops.cu`), 선택형 Triton 커널(`ltx_gui/triton_kernels.py`),
+CPU/PyTorch 대체 경로(`ltx_gui/cuda_backend.py`)를 연결했습니다.
+
+- 융합 **masked latent Euler update**와 **픽셀 블렌딩** CUDA 커널
+- Triton의 융합 `RMSNorm` 및 `uint8 NHWC -> float32 BCTHW` GPU 전처리
+- RoPE geometry 캐시(최대 4개), 실제 DiT forward에 대한 `torch.compile` 캐시
+- GPU 커널 선택 `auto/torch/triton/cuda`, 선택형 `bf16/fp16` 혼합정밀도, CLI 및 GUI 연동
+- 독립 CUDA C++ 확장 빌드 스크립트 `setup_cuda.py`, correctness 회귀 테스트, 커널 벤치마크·프로파일러
+
+```powershell
+python -m pip install -e ".[native,test]"
+# GPU용 PyTorch/CUDA 설치 후; NVCC가 있는 경우만 CUDA C++ 커널 직접 빌드
+python setup_cuda.py build_ext --inplace
+ltx-restore input.mp4 --rectangle 0.2,0.2,0.7,0.7 --method neural --checkpoint checkpoints/native.pt --device cuda:0 --gpu-backend cuda --amp none
+```
+
+**검증 범위:** CPU 정합성 테스트 통과. 이 개발 환경은 CUDA GPU와 NVCC가 없어 CUDA C++ 빌드,
+실 GPU 커널 실행/화질·성능은 측정하지 못했습니다. 연구용 경량 모델은 공식 LTX-2.5 22B
+모델의 동일 구조가 아니며 공식 가중치와 호환되지 않습니다.
+
+[GPU 커널 상세·제약·실측 방법](docs/CUDA.md)
 
 ## v0.4.0 — 독립 신경망 실행 및 병목 개선
 

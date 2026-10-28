@@ -291,6 +291,20 @@ class MainWindow(QMainWindow):
             neural_controls.addWidget(control)
         neural_controls.addWidget(self.native_compile)
         controls.addLayout(neural_controls, 8, 0, 1, 3)
+        gpu_row = QHBoxLayout()
+        self.gpu_backend = QComboBox()
+        for name in ("auto", "torch", "triton", "cuda"):
+            self.gpu_backend.addItem(name)
+        self.gpu_backend.setCurrentText(opts.neural_gpu_backend)
+        self.gpu_amp = QComboBox()
+        for name in ("none", "bf16", "fp16"):
+            self.gpu_amp.addItem(name)
+        self.gpu_amp.setCurrentText(opts.neural_amp)
+        gpu_row.addWidget(QLabel("GPU 커널"))
+        gpu_row.addWidget(self.gpu_backend)
+        gpu_row.addWidget(QLabel("혼합 정밀도"))
+        gpu_row.addWidget(self.gpu_amp)
+        controls.addLayout(gpu_row, 9, 0, 1, 3)
         advanced = QHBoxLayout()
         for title, widget in (("공간 반경", self.radius), ("Temporal 가중치", self.weight), ("Flow 배율", self.flow)):
             advanced.addWidget(QLabel(title))
@@ -401,7 +415,9 @@ class MainWindow(QMainWindow):
                        neural_device=self.native_device.currentText().strip(),
                        neural_steps=self.native_steps.value(),
                        neural_clip_frames=int(self.native_frames.currentText()),
-                       neural_compile=self.native_compile.isChecked())
+                       neural_compile=self.native_compile.isChecked(),
+                       neural_gpu_backend=self.gpu_backend.currentText(),
+                       neural_amp=self.gpu_amp.currentText())
 
     def persist(self):
         try:

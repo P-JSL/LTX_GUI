@@ -68,6 +68,8 @@ class Options:
     neural_steps: int = 8
     neural_clip_frames: int = 9
     neural_compile: bool = False
+    neural_gpu_backend: str = "auto"
+    neural_amp: str = "none"
 
     def validate(self) -> None:
         if self.method not in METHODS or self.encoder not in ENCODERS:
@@ -92,6 +94,12 @@ class Options:
             raise ValueError("확산 단계는 1~1000 사이여야 합니다.")
         if not 9 <= self.neural_clip_frames <= 129 or (self.neural_clip_frames-1) % 8:
             raise ValueError("신경망 클립은 9,17,...,129 프레임만 지원합니다.")
+        if self.neural_gpu_backend not in ("auto", "torch", "triton", "cuda"):
+            raise ValueError("GPU 커널 종류는 auto, torch, triton, cuda 중 하나입니다.")
+        if self.neural_amp not in ("none", "bf16", "fp16"):
+            raise ValueError("GPU 혼합 정밀도는 none, bf16, fp16 중 하나입니다.")
+        if self.neural_amp != "none" and self.neural_device == "cpu":
+            raise ValueError("혼합 정밀도는 CUDA 장치에서만 사용 가능합니다.")
         if not self.ffmpeg.strip():
             raise ValueError("FFmpeg 실행 파일 경로가 필요합니다.")
 

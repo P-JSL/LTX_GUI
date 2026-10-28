@@ -62,3 +62,15 @@ warmup 3회, 15회 중앙값) 예시:
 model 객체에서 컴파일 러너를 재사용하도록 변경했습니다. clip 단위 생성은
 이웃 chunk의 원본 마지막 프레임 1장을 문맥으로 재사용하며, chunk 경계의
 생성 일관성은 추가 검증이 필요합니다.
+
+## v0.5.0 CUDA C++ / Triton 실제 구현
+
+추가된 코드: `cuda/fused_ops.cu`, `cuda/fused_ops.cpp`, `ltx_gui/triton_kernels.py`,
+`ltx_gui/cuda_backend.py`, `scripts/bench_cuda_ops.py`, `scripts/profile_cuda.py`.
+추론의 mask update, compositing 경로에 선택형 CUDA 및 Triton을 연결합니다.
+전체 `Transformer.forward`의 Flash attention은 PyTorch SDPA dispatch를 유지하고
+학습 경로는 PyTorch/autograd를 유지합니다.
+
+**현재 CUDA GPU와 NVCC가 없어 실 GPU 속도/화질 및 확장 빌드 결과는 확인하지 못했습니다.**
+문서와 테스트에 CPU 데이터를 CUDA 측정치로 표시하지 않습니다.
+세부 사항은 [CUDA.md](CUDA.md)를 참고하세요.

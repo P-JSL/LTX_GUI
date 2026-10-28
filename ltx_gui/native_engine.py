@@ -70,6 +70,18 @@ def restore_native_video(planned: PlannedJob, options: Options,
         raise Cancelled("복원이 시작되기 전에 취소했습니다")
     vae, flow, metadata = load_trained(options.checkpoint_path, device=options.neural_device)
     del metadata
+    if options.neural_device.startswith("cuda"):
+        if not __import__("torch").cuda.is_available():
+            raise RuntimeError("선택한 CUDA 장치에서 GPU를 사용할 수 없습니다.")
+        # Enable inference-only kernel fusion; leave training behavior intact.
+        from .neural.model import RMSNorm
+        for module in flow.modules():
+            if isinstance(module, RMSNorm):
+                # With torch.compile the compiler can already fuse RMSNorm;
+                # avoid custom kernels inside a compiled transformer graph.
+                module.gpu_backend = ("torch" if options.neural_compile else
+                                      "triton" if options.neural_gpu_backend == "triton" else
+                                      "auto" if options.neural_gpu_backend == "auto" else "torch")
     source = cv2.VideoCapture(str(planned.source))
     if not source.isOpened():
         raise ValueError(f"입력 영상을 열 수 없습니다: {planned.source}")
@@ -133,7 +145,9 @@ def restore_native_video(planned: PlannedJob, options: Options,
                     # OpenCV/FFmpeg operate on BGR; neural model expects RGB.
                     restored_rgb = inpaint_arrays(np.ascontiguousarray(frames[..., ::-1]), masks,
                                                   vae, flow, steps=options.neural_steps,
-                                                  compile_dit=options.neural_compile)
+                                                  compile_dit=options.neural_compile,
+                                                  gpu_backend=options.neural_gpu_backend,
+                                                  amp=options.neural_amp)
                     restored = np.ascontiguousarray(restored_rgb[..., ::-1])
                 else:
                     restored = frames  # zero-mask fast path: no GPU launches
