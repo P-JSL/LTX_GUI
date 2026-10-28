@@ -82,6 +82,10 @@ def restore_native_video(planned: PlannedJob, options: Options,
                 module.gpu_backend = ("torch" if options.neural_compile else
                                       "triton" if options.neural_gpu_backend == "triton" else
                                       "auto" if options.neural_gpu_backend == "auto" else "torch")
+    if options.neural_video_io == "nvcodec":
+        from .nvcodec_pipeline import restore_nvcodec_video
+        return restore_nvcodec_video(planned, options, vae, flow, stop=stop, progress=progress)
+    runtime_cache: dict = {}
     source = cv2.VideoCapture(str(planned.source))
     if not source.isOpened():
         raise ValueError(f"입력 영상을 열 수 없습니다: {planned.source}")
@@ -147,7 +151,12 @@ def restore_native_video(planned: PlannedJob, options: Options,
                                                   vae, flow, steps=options.neural_steps,
                                                   compile_dit=options.neural_compile,
                                                   gpu_backend=options.neural_gpu_backend,
-                                                  amp=options.neural_amp)
+                                                  amp=options.neural_amp,
+                                                  runtime_cache=runtime_cache,
+                                                  engine=options.neural_accelerator,
+                                                  precision=options.neural_precision,
+                                                  cuda_graph=options.neural_cuda_graph,
+                                                  fp8_calibration=options.neural_fp8_calibration)
                     restored = np.ascontiguousarray(restored_rgb[..., ::-1])
                 else:
                     restored = frames  # zero-mask fast path: no GPU launches

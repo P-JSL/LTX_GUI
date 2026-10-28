@@ -1,4 +1,4 @@
-# LTX GUI — Independent Restoration Engine (v0.5.0)
+# LTX GUI — Independent Restoration Engine (v0.6.0)
 
 **JASNA를 실행·연동·복사하지 않는 독립 Windows GUI 영상 인페인팅 응용프로그램입니다.**
 Python/PySide6 UI + OpenCV(C++ 내부 최적화 연산) + 별도 설치된 FFmpeg를 사용합니다.
@@ -8,6 +8,21 @@ Python/PySide6 UI + OpenCV(C++ 내부 최적화 연산) + 별도 설치된 FFmpe
 > 인페인팅으로 선택 영역을 근사 복원하는 실동작 버전입니다. 큰 면적·복잡한 원본 콘텐츠를
 > 재구성하거나 기존에 사라진 픽셀을 진짜 원본으로 되찾을 수는 없습니다.
 
+
+## v0.6.0 — NVIDIA 추론 / GPU 영상 I/O (실 GPU 미검증)
+
+사용자가 요청한 옵션에 따라 기존 독립 경량 DiT/VAE에 다음 실험적 GPU 백엔드를 추가했습니다.
+공식 **LTX-2.5 22B 가중치 호환성은 이번 범위에서 제외**했습니다.
+
+- `--accelerator tensorrt`: VideoVAE 인코더, DiT, VideoVAE 디코더를 각각 Torch-TensorRT로 변환 시도. 각 구성요소에서 `require_full_compilation=True`를 강제하고 변환 실패를 오류로 보고 (숨은 fallback 금지).
+- `--precision fp8 --fp8-calibration ...`: Hopper 이상, ModelOpt 설치, **실제 대표 영상/마스크**를 요구하는 FP8 교정/변환 경로. 가중치 평균이나 랜덤 교정 자료로 학습 모델을 대체하지 않음.
+- `--cuda-graph`: 고정 shape의 VAE encode → DiT denoise loop → VAE decode → masked composite GPU 연산을 정적 버퍼로 캡처/재실행하는 실험적 경로.
+- `--video-io nvcodec --encoder h264_nvenc`: NVIDIA NVDEC DLPack 공유와 GPU 추론·NVENC GPU 버퍼, 최종 FFmpeg 오디오 mux. 정적 마스크·CFR H.264에 한정. GPU 내부 배열 변환은 복사가 발생하며 **완전한 zero-copy는 아님**.
+- `scripts.validate_acceleration`: 실제 NVIDIA 장비에서 eager/TensorRT/Graph의 CUDA Event latency, peak VRAM 및 numerical difference를 기록. 기존 `scripts.compare_results`는 별도 JASNA 출력과 ground truth 비교를 지원.
+
+**이번 환경은 CPU 전용이므로 TensorRT 변환 성공, FP8 정합성, CUDA Graph 캡처/리플레이, 실제 NVCodec 인코딩, JASNA 성능 수치가 확인되지 않았습니다.** GPU에서는 완전 변환에 실패하는 모델 연산이 있을 수 있으며 오류를 숨기지 않습니다.
+
+자세한 설치 전제·사용 예시·제약: [GPU 가속 실험 구현](docs/ACCELERATION.md).
 
 ## v0.5.0 — 독립 GPU 커널 구현 및 적용
 

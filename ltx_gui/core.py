@@ -70,6 +70,11 @@ class Options:
     neural_compile: bool = False
     neural_gpu_backend: str = "auto"
     neural_amp: str = "none"
+    neural_accelerator: str = "torch"
+    neural_precision: str = "fp32"
+    neural_cuda_graph: bool = False
+    neural_fp8_calibration: str = ""
+    neural_video_io: str = "opencv"
 
     def validate(self) -> None:
         if self.method not in METHODS or self.encoder not in ENCODERS:
@@ -100,6 +105,19 @@ class Options:
             raise ValueError("GPU 혼합 정밀도는 none, bf16, fp16 중 하나입니다.")
         if self.neural_amp != "none" and self.neural_device == "cpu":
             raise ValueError("혼합 정밀도는 CUDA 장치에서만 사용 가능합니다.")
+        from .acceleration import AccelerationSettings
+        AccelerationSettings(engine=self.neural_accelerator, precision=self.neural_precision,
+                             cuda_graph=self.neural_cuda_graph).validate(device=self.neural_device)
+        if self.neural_accelerator == "torch" and self.neural_precision != "fp32":
+            raise ValueError("PyTorch 정밀도 변경은 GPU 혼합 정밀도(AMP) 설정을 사용하세요.")
+        if self.neural_precision == "fp8" and not self.neural_fp8_calibration:
+            raise ValueError("FP8 양자화에는 실측 대표 입력 .npz 데이터가 필요합니다.")
+        if self.neural_video_io not in ("opencv", "nvcodec"):
+            raise ValueError("영상 IO는 opencv 또는 nvcodec만 지원합니다.")
+        if self.neural_video_io == "nvcodec" and (self.method != "neural" or not self.neural_device.startswith("cuda")):
+            raise ValueError("NVDEC/NVENC 영상 IO는 CUDA 신경망 모드에서만 사용합니다.")
+        if self.neural_compile and self.neural_accelerator != "torch":
+            raise ValueError("torch.compile과 TensorRT는 동시에 선택할 수 없습니다.")
         if not self.ffmpeg.strip():
             raise ValueError("FFmpeg 실행 파일 경로가 필요합니다.")
 
@@ -139,6 +157,10 @@ def plan_job(job: Job, options: Options) -> PlannedJob:
     selected_modes = int(job.rectangle is not None) + int(bool(job.mask_path.strip())) + int(job.auto_detect)
     if selected_modes != 1:
         raise ValueError("마스크 이미지, 사각형 또는 자동 탐지 중 하나를 지정해야 합니다.")
+    if options.neural_video_io == "nvcodec" and job.auto_detect:
+        raise ValueError("NVCodec mode currently supports static masks only; use OpenCV mode for automatic detection")
+    if options.neural_video_io == "nvcodec" and options.encoder != "h264_nvenc":
+        raise ValueError("NVCodec mode requires h264_nvenc")
     if options.method == "neural" and not Path(options.checkpoint_path).is_file():
         raise FileNotFoundError("독립 신경망의 학습된 .pt 체크포인트를 지정해야 합니다.")
     if job.auto_detect and not Path(options.detector_model).is_file():

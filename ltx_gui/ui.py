@@ -305,6 +305,28 @@ class MainWindow(QMainWindow):
         gpu_row.addWidget(QLabel("혼합 정밀도"))
         gpu_row.addWidget(self.gpu_amp)
         controls.addLayout(gpu_row, 9, 0, 1, 3)
+        acceleration_row = QHBoxLayout()
+        self.accelerator = QComboBox()
+        self.accelerator.addItems(["torch", "tensorrt"])
+        self.accelerator.setCurrentText(opts.neural_accelerator)
+        self.model_precision = QComboBox()
+        self.model_precision.addItems(["fp32", "fp16", "bf16", "fp8"])
+        self.model_precision.setCurrentText(opts.neural_precision)
+        self.cuda_graph = QCheckBox("CUDA Graph (고정 입력 형태)")
+        self.cuda_graph.setChecked(opts.neural_cuda_graph)
+        self.video_io = QComboBox()
+        self.video_io.addItems(["opencv", "nvcodec"])
+        self.video_io.setCurrentText(opts.neural_video_io)
+        for label, control in (("추론 엔진", self.accelerator), ("정밀도", self.model_precision),
+                               ("GPU 영상 IO", self.video_io)):
+            acceleration_row.addWidget(QLabel(label))
+            acceleration_row.addWidget(control)
+        acceleration_row.addWidget(self.cuda_graph)
+        controls.addLayout(acceleration_row, 10, 0, 1, 3)
+        self.fp8_calibration = QLineEdit(opts.neural_fp8_calibration)
+        self.fp8_calibration.setPlaceholderText("FP8 대표 입력 .npz (frames, masks)")
+        controls.addWidget(QLabel("FP8 교정 데이터"), 11, 0)
+        controls.addWidget(self.fp8_calibration, 11, 1, 1, 2)
         advanced = QHBoxLayout()
         for title, widget in (("공간 반경", self.radius), ("Temporal 가중치", self.weight), ("Flow 배율", self.flow)):
             advanced.addWidget(QLabel(title))
@@ -417,7 +439,12 @@ class MainWindow(QMainWindow):
                        neural_clip_frames=int(self.native_frames.currentText()),
                        neural_compile=self.native_compile.isChecked(),
                        neural_gpu_backend=self.gpu_backend.currentText(),
-                       neural_amp=self.gpu_amp.currentText())
+                       neural_amp=self.gpu_amp.currentText(),
+                       neural_accelerator=self.accelerator.currentText(),
+                       neural_precision=self.model_precision.currentText(),
+                       neural_cuda_graph=self.cuda_graph.isChecked(),
+                       neural_fp8_calibration=self.fp8_calibration.text().strip(),
+                       neural_video_io=self.video_io.currentText())
 
     def persist(self):
         try:

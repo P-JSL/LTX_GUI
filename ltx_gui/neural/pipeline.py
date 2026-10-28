@@ -53,7 +53,9 @@ def latent_mask_from_pixels(mask: Tensor, latent_shape: tuple[int, int, int]) ->
 @torch.no_grad()
 def inpaint_tensor(video: Tensor, mask: Tensor, vae: VideoVAE, flow: LatentFlow,
                    *, steps: int = 8, seed: int = 42, compile_dit: bool = False,
-                   gpu_backend: str = "auto", amp: str = "none") -> Tensor:
+                   gpu_backend: str = "auto", amp: str = "none",
+                   predictor=None, encoder=None, decoder=None, graph_runner=None,
+                   assume_nonempty: bool = False) -> Tensor:
     """Inpaint normalized [0,1] pixels and preserve nonmasked pixels exactly.
 
     PyTorch SDPA chooses a fused GPU attention kernel when supported. Compiling
@@ -71,16 +73,19 @@ def inpaint_tensor(video: Tensor, mask: Tensor, vae: VideoVAE, flow: LatentFlow,
         raise ValueError("Mixed precision requires CUDA")
     if amp == "bf16" and not torch.cuda.is_bf16_supported():
         raise ValueError("The selected CUDA device does not support BF16")
-    if torch.count_nonzero(mask) == 0:
+    if not assume_nonempty and torch.count_nonzero(mask) == 0:
         return video.clone()
     padded, padded_mask, original_shape = pad_video(video, mask)
+    if graph_runner is not None:
+        result = graph_runner.run(padded, padded_mask, seed=seed)
+        t, h, w = original_shape
+        return result[:, :, :t, :h, :w]
     generator = torch.Generator(device=padded.device).manual_seed(seed)
     precision_context = (torch.autocast("cuda", dtype=torch.bfloat16 if amp == "bf16" else torch.float16)
                          if amp != "none" else nullcontext())
     with precision_context:
-        mu, _ = vae.encode(padded)
-    latent_mask = latent_mask_from_pixels(padded_mask, mu.shape[2:])
-    predictor = None
+        mu, _ = (encoder or vae.encode)(padded)
+    latent_mask = latent_mask_from_pixels(padded_mask, mu.shape[2:]).to(mu.dtype)
     if compile_dit:
         if padded.device.type != "cuda":
             raise ValueError("torch.compile requires CUDA in this application")
@@ -94,7 +99,7 @@ def inpaint_tensor(video: Tensor, mask: Tensor, vae: VideoVAE, flow: LatentFlow,
         z = flow.sample(mu, latent_mask, steps=steps, generator=generator,
                         gpu_backend=gpu_backend,
                         assume_nonempty=True, predictor=predictor)
-        pixels = vae.decode(z)
+        pixels = (decoder or vae.decode)(z)
     t, h, w = original_shape
     # Original pixels outside mask are bytewise preserved when returned as uint8.
     from ..cuda_backend import masked_composite
@@ -131,18 +136,62 @@ def clip_arrays_to_tensor(frames: np.ndarray, masks: np.ndarray, device: str,
 
 
 @torch.no_grad()
+def accelerated_inpaint_tensor(video: Tensor, mask: Tensor, vae: VideoVAE, flow: LatentFlow,
+                               *, steps: int = 8, seed: int = 42,
+                               compile_dit: bool = False, gpu_backend: str = "auto",
+                               amp: str = "none", runtime_cache: dict | None = None,
+                               engine: str = "torch", cuda_graph: bool = False,
+                               precision: str = "fp32", fp8_calibration: str = "",
+                               assume_nonempty: bool = False) -> Tensor:
+    """One prepared inference path for CPU/OpenCV or NVIDIA device-video I/O."""
+    prepared = {}
+    if engine == "tensorrt" or cuda_graph:
+        if runtime_cache is None:
+            raise ValueError("GPU acceleration requires a per-job runtime cache")
+        padded, padded_mask, _ = pad_video(video, mask)
+        key = (engine, cuda_graph, precision, steps, amp, tuple(padded.shape))
+        if key not in runtime_cache:
+            from ..acceleration import AccelerationSettings, compile_tensorrt_components, require_cuda
+            settings = AccelerationSettings(engine=engine, precision=precision, cuda_graph=cuda_graph)
+            require_cuda(settings, str(video.device))
+            enc = pred = dec = None
+            if engine == "tensorrt":
+                from ..acceleration import load_fp8_calibration
+                calibration = (load_fp8_calibration(fp8_calibration, vae, padded, padded_mask)
+                               if precision == "fp8" else None)
+                enc, pred, dec = compile_tensorrt_components(
+                    vae, flow, padded, padded_mask, settings, calibration=calibration)
+            runner = None
+            if cuda_graph:
+                from ..cuda_graph import NativeCudaGraph
+                runner = NativeCudaGraph(vae, flow, padded, padded_mask, steps=steps,
+                                         amp=amp, encoder=enc, predictor=pred, decoder=dec)
+            runtime_cache.clear()  # At most one clip shape's compiled engines/graph in RAM.
+            runtime_cache[key] = (enc, pred, dec, runner)
+        enc, pred, dec, runner = runtime_cache[key]
+        prepared = {"encoder": enc, "predictor": pred, "decoder": dec,
+                    "graph_runner": runner}
+    return inpaint_tensor(video, mask, vae, flow, steps=steps,
+                           seed=seed, compile_dit=compile_dit if engine == "torch" and not cuda_graph else False,
+                           gpu_backend=gpu_backend, amp=amp, assume_nonempty=assume_nonempty, **prepared)
+
+@torch.no_grad()
 def inpaint_arrays(frames: np.ndarray, masks: np.ndarray,
                    vae: VideoVAE, flow: LatentFlow, *, steps: int = 8,
                    seed: int = 42, compile_dit: bool = False,
-                   gpu_backend: str = "auto", amp: str = "none") -> np.ndarray:
+                   gpu_backend: str = "auto", amp: str = "none",
+                   runtime_cache: dict | None = None, engine: str = "torch",
+                   cuda_graph: bool = False, precision: str = "fp32",
+                   fp8_calibration: str = "") -> np.ndarray:
     try:
         device = next(vae.parameters()).device
     except StopIteration:
         raise ValueError("VAE has no parameters")
     video, mask = clip_arrays_to_tensor(frames, masks, str(device), gpu_backend=gpu_backend)
-    output = inpaint_tensor(video, mask, vae, flow, steps=steps,
-                           seed=seed, compile_dit=compile_dit,
-                           gpu_backend=gpu_backend, amp=amp)
+    output = accelerated_inpaint_tensor(video, mask, vae, flow, steps=steps, seed=seed,
+                    compile_dit=compile_dit, gpu_backend=gpu_backend, amp=amp,
+                    runtime_cache=runtime_cache, engine=engine, cuda_graph=cuda_graph,
+                    precision=precision, fp8_calibration=fp8_calibration)
     result = output.mul(255).round().clamp_(0,255).to(torch.uint8).squeeze(0).permute(1,2,3,0).cpu().numpy()
     # Direct replacement guarantees exact original uint8 in nonmasked regions.
     return np.where((masks > 0)[..., None], result, frames)

@@ -34,6 +34,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--compile-neural", action="store_true")
     parser.add_argument("--gpu-backend", choices=("auto", "torch", "triton", "cuda"), default="auto")
     parser.add_argument("--amp", choices=("none", "bf16", "fp16"), default="none")
+    parser.add_argument("--accelerator", choices=("torch", "tensorrt"), default="torch")
+    parser.add_argument("--precision", choices=("fp32", "fp16", "bf16", "fp8"), default="fp32")
+    parser.add_argument("--cuda-graph", action="store_true", help="Capture full fixed-shape inference")
+    parser.add_argument("--fp8-calibration", default="", help="Representative .npz calibration clips, no random calibration")
+    parser.add_argument("--video-io", choices=("opencv", "nvcodec"), default="opencv")
     ns = parser.parse_args(argv)
     options = Options(method=ns.method, encoder=ns.encoder, radius=ns.radius,
                       temporal_weight=ns.weight, flow_scale=ns.flow_scale, ffmpeg=ns.ffmpeg,
@@ -43,7 +48,10 @@ def main(argv: list[str] | None = None) -> int:
                       checkpoint_path=ns.checkpoint, neural_device=ns.device,
                       neural_steps=ns.steps, neural_clip_frames=ns.clip_frames,
                       neural_compile=ns.compile_neural,
-                      neural_gpu_backend=ns.gpu_backend, neural_amp=ns.amp)
+                      neural_gpu_backend=ns.gpu_backend, neural_amp=ns.amp,
+                      neural_accelerator=ns.accelerator, neural_precision=ns.precision,
+                      neural_cuda_graph=ns.cuda_graph,
+                      neural_fp8_calibration=ns.fp8_calibration, neural_video_io=ns.video_io)
     job = Job(ns.input, rectangle=ns.rectangle, mask_path=ns.mask, output_path=ns.output,
               auto_detect=ns.auto_detect)
     try:

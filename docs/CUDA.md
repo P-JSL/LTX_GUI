@@ -10,7 +10,7 @@
 - 자동 모드: 빌드된 CUDA C++ 확장 → Triton → PyTorch 기본 연산. CPU는 항상 PyTorch 대체 경로입니다. 강제 백엔드(`cuda`/`triton`)가 불가능하면 **명시적으로 오류**를 반환하며, CPU 연산을 GPU라고 표시하지 않습니다.
 - `bf16` / `fp16` AMP는 옵트인입니다(기본 `none`). GPU와 모델의 정밀도 허용 범위에 따라 오차/품질이 달라질 수 있습니다. 학습/gradient 경로는 변경하지 않습니다.
 
-**미구현:** 정식 LTX-2.5 22B 가중치 호환 Transformer/VAE, TensorRT 엔진, FP8 학습/추론, 맞춤형 FlashAttention 전체 재작성, 커널별 CUDA Graph 직접 캡처, 장치에서의 영상 디코딩과 인코딩 간 zero-copy 파이프라인. `torch.compile`의 내부 CUDA Graph 사용 가능성은 PyTorch 환경에 의존합니다. 현재 커널이 위 기능을 대체한다고 주장하지 않습니다.
+**v0.5.0 당시 미구현이었으나 v0.6.0에서 실험 경로 추가:** TensorRT/FP8 시도, CUDA Graph 추론, GPU 영상 I/O (상세: [ACCELERATION.md](ACCELERATION.md)). **여전히 미구현:** 정식 LTX-2.5 22B 가중치 호환 Transformer/VAE, 맞춤형 FlashAttention 전체 재작성, 검증된 GPU 비디오 전체 zero-copy 구현. `torch.compile`의 내부 CUDA Graph 사용 가능성은 PyTorch 환경에 의존합니다. 현재 커널이 위 기능을 대체한다고 주장하지 않습니다.
 
 ## 실행 전 요건
 
