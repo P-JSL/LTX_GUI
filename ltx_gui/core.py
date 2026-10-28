@@ -54,6 +54,15 @@ class Options:
     temporal_weight: float = 0.35
     flow_scale: float = 0.5
     ffmpeg: str = "ffmpeg"
+    detector_model: str = ""
+    detector_confidence: float = 0.35
+    detector_cuda: bool = False
+    detector_format: str = "xyxy6"
+    detector_class: int = 0
+    detector_input_size: int = 640
+    tracker_iou: float = 0.20
+    tracker_gap: int = 2
+    tracker_padding: int = 3
 
     def validate(self) -> None:
         if self.method not in METHODS or self.encoder not in ENCODERS:
@@ -64,6 +73,14 @@ class Options:
             raise ValueError("시간축 합성 강도는 0~0.8이어야 합니다.")
         if not 0.125 <= self.flow_scale <= 1:
             raise ValueError("Optical Flow 해상도 배율은 0.125~1이어야 합니다.")
+        if not 0 < self.detector_confidence <= 1:
+            raise ValueError("자동 탐지 신뢰도 범위는 (0,1]입니다.")
+        if self.detector_format not in ("xyxy6", "yolo_cls") or self.detector_class < 0:
+            raise ValueError("지원하지 않는 탐지 출력 형식 또는 클래스입니다.")
+        if self.detector_input_size < 32 or self.detector_input_size % 32:
+            raise ValueError("탐지 해상도는 32의 배수여야 합니다.")
+        if not 0 <= self.tracker_iou < 1 or not 0 <= self.tracker_gap <= 120 or not 0 <= self.tracker_padding <= 256:
+            raise ValueError("추적기 설정 범위가 올바르지 않습니다.")
         if not self.ffmpeg.strip():
             raise ValueError("FFmpeg 실행 파일 경로가 필요합니다.")
 
@@ -74,6 +91,7 @@ class Job:
     rectangle: Rectangle | None = None
     mask_path: str = ""
     output_path: str = ""
+    auto_detect: bool = False
 
 
 @dataclass(frozen=True)
@@ -99,8 +117,11 @@ def plan_job(job: Job, options: Options) -> PlannedJob:
     source = normalize_path(job.input_path)
     if not source.is_file() or source.suffix.lower() not in VIDEO_EXTENSIONS:
         raise ValueError(f"영상 파일이 없거나 확장자를 지원하지 않습니다: {source}")
-    if (job.rectangle is None) == (not bool(job.mask_path.strip())):
-        raise ValueError("마스크 이미지 또는 사각형 중 정확히 하나를 지정해야 합니다.")
+    selected_modes = int(job.rectangle is not None) + int(bool(job.mask_path.strip())) + int(job.auto_detect)
+    if selected_modes != 1:
+        raise ValueError("마스크 이미지, 사각형 또는 자동 탐지 중 하나를 지정해야 합니다.")
+    if job.auto_detect and not Path(options.detector_model).is_file():
+        raise FileNotFoundError("자동 탐지를 위한 학습된 ONNX 모델 파일을 지정해야 합니다.")
     if job.rectangle:
         job.rectangle.validate()
     mask = normalize_path(job.mask_path) if job.mask_path.strip() else None

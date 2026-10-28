@@ -43,7 +43,7 @@ class QueueModel(QAbstractTableModel):
             return None
         if role == Qt.ItemDataRole.DisplayRole:
             item = self.queue[index.row()]
-            region = item.rectangle.as_text() if item.rectangle else (Path(item.mask_path).name if item.mask_path else "미지정")
+            region = item.rectangle.as_text() if item.rectangle else (Path(item.mask_path).name if item.mask_path else ("자동 탐지" if item.auto_detect else "미지정"))
             return (Path(item.input_path).name, region, self.states.get(index.row(), "대기"))[index.column()]
         return None
 
@@ -199,6 +199,7 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         for title, call in (("영상 추가", self.add_files), ("폴더 추가", self.add_folder),
                             ("영역 선택", self.select_region), ("마스크 이미지", self.select_mask),
+                            ("자동 탐지", self.select_auto_detect),
                             ("선택 제거", self.remove_selected)):
             button = QPushButton(title)
             button.clicked.connect(call)
@@ -250,6 +251,19 @@ class MainWindow(QMainWindow):
         self.flow.setRange(0.125, 1.0)
         self.flow.setSingleStep(0.125)
         self.flow.setValue(opts.flow_scale)
+        self.detector_model = QLineEdit(opts.detector_model)
+        self.detector_model.setPlaceholderText("모자이크 탐지용 학습된 ONNX 파일 경로")
+        browse_detector = QPushButton("찾기")
+        browse_detector.clicked.connect(self.choose_detector)
+        controls.addWidget(QLabel("자동 탐지 모델"), 5, 0)
+        controls.addWidget(self.detector_model, 5, 1)
+        controls.addWidget(browse_detector, 5, 2)
+        self.detector_confidence = QDoubleSpinBox()
+        self.detector_confidence.setRange(0.01, 1.0)
+        self.detector_confidence.setSingleStep(0.05)
+        self.detector_confidence.setValue(opts.detector_confidence)
+        controls.addWidget(QLabel("탐지 신뢰도"), 6, 0)
+        controls.addWidget(self.detector_confidence, 6, 1)
         advanced = QHBoxLayout()
         for title, widget in (("공간 반경", self.radius), ("Temporal 가중치", self.weight), ("Flow 배율", self.flow)):
             advanced.addWidget(QLabel(title))
@@ -306,7 +320,7 @@ class MainWindow(QMainWindow):
             index = self.selected_row()
             dialog = RegionDialog(self.queue[index].input_path, self)
             if dialog.exec() == QDialog.DialogCode.Accepted:
-                self.queue.update_at(index, rectangle=dialog.selected, mask_path="")
+                self.queue.update_at(index, rectangle=dialog.selected, mask_path="", auto_detect=False)
                 self.model.refresh()
         except (ValueError, OSError) as exc:
             QMessageBox.warning(self, "영역 선택", str(exc))
@@ -321,7 +335,7 @@ class MainWindow(QMainWindow):
             return
         path, _ = QFileDialog.getOpenFileName(self, "흰색=복원, 검정=보존", "", "Image (*.png *.bmp *.jpg *.jpeg)")
         if path:
-            self.queue.update_at(index, rectangle=None, mask_path=path)
+            self.queue.update_at(index, rectangle=None, mask_path=path, auto_detect=False)
             self.model.refresh()
 
     def choose_output(self):
@@ -329,11 +343,28 @@ class MainWindow(QMainWindow):
         if folder:
             self.output.setText(folder)
 
+    def select_auto_detect(self):
+        if self.busy:
+            return
+        try:
+            index = self.selected_row()
+            self.queue.update_at(index, rectangle=None, mask_path="", auto_detect=True)
+            self.model.refresh()
+        except ValueError as exc:
+            QMessageBox.warning(self, "영상 선택", str(exc))
+
+    def choose_detector(self):
+        path, _ = QFileDialog.getOpenFileName(self, "ONNX 탐지 모델 선택", "", "ONNX (*.onnx)")
+        if path:
+            self.detector_model.setText(path)
+
     def options(self):
         return Options(output_dir=self.output.text().strip(), method=self.method.currentData(),
                        encoder=self.encoder.currentData(), radius=self.radius.value(),
                        temporal_weight=self.weight.value(), flow_scale=self.flow.value(),
-                       ffmpeg=self.ffmpeg.text().strip())
+                       ffmpeg=self.ffmpeg.text().strip(),
+                       detector_model=self.detector_model.text().strip(),
+                       detector_confidence=self.detector_confidence.value())
 
     def persist(self):
         try:

@@ -35,10 +35,19 @@
 - LTX-2.5 모델과 weights는 별도의 **LTX-2.x Community License**다.
   대규모 사업자 상업 이용, 제한된 사용 목적, 배포 의무 등을 별도로 확인해야 한다.
   '오픈 웨이트'는 MIT 또는 자유로운 무조건 상업 이용을 뜻하지 않는다.
-- 본 프로젝트는 LTX-2.5 weights, ComfyUI, ltx-pipelines, Jasna를 사용하거나 번들링하지 않는다.
+- v0.3부터 LTX-2.5 공개 ltx-core/ltx-pipelines를 **선택적 별도 설치 의존성**으로 사용할 수 있다. JASNA는 호출/복사하지 않고 모델 가중치를 번들링하지 않는다. 공식 LTX 컴포넌트의 라이선스를 MIT라고 표시하지 않는다.
 - 현대 딥러닝 기반 인페인팅 엔진으로 동일 성능을 내기 위해서는 공개/직접 학습한 모델,
   실제 입력 영상, VRAM 환경, 품질 지표를 이용한 검증이 필요하다.
 
 ## 사실 관계
 모자이크 등으로 이미 소실된 픽셀의 **실제 원본 복구를 증명할 수 없다.**
 인페인팅 결과는 근접 픽셀 및 움직임으로 만들어낸 가상적 대체 영상이다.
+
+
+## v0.3.0 보강 검토 (2026-10-28)
+- Model Soups (Wortsman et al., ICML 2022): 사전학습 후 유사 학습 경로의 가중치 평균 조건. https://proceedings.mlr.press/v162/wortsman22a.html
+- Diffusion Soup (Biggs et al., 2024): 실제 학습된 diffusion checkpoint들의 병합 연구. https://arxiv.org/abs/2406.08431
+- ByteTrack (Zhang et al., ECCV 2022): 미검출과 짧은 공백을 다루는 저신뢰 검출 연계. 본 프로그램은 완전한 ByteTrack 아닌 IoU-based 추적만 구현. https://arxiv.org/abs/2110.06864
+- LTX-2.5 공식 모델 팩: 22B distilled / Gemma4 / Video VAE / Audio VAE의 **실제 학습된 체크포인트 필수**, 평균 상수 가중치로 대체 불가. https://huggingface.co/Lightricks/LTX-2.5
+
+**독립성 정의:** JASNA 미사용. 생성형 모델 내부 연산을 완전히 처음부터 재구현한 것은 아니며, 선택적으로 공식 Lightricks 공개 라이브러리를 로드한다.

@@ -49,5 +49,6 @@ def load_settings(path: Path | None = None) -> tuple[Options, list[Job]]:
         region = item.get("rectangle")
         rect = Rectangle(**region) if isinstance(region, dict) else None
         jobs.append(Job(input_path=item["input_path"], rectangle=rect,
-                        mask_path=item.get("mask_path", ""), output_path=item.get("output_path", "")))
+                        mask_path=item.get("mask_path", ""), output_path=item.get("output_path", ""),
+                        auto_detect=bool(item.get("auto_detect", False))))
     return opts, jobs

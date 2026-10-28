@@ -84,10 +84,28 @@ class SpatialTemporalInpaint:
             self.grid_x, self.grid_y = np.meshgrid(
                 np.arange(x1-x0, dtype=np.float32), np.arange(y1-y0, dtype=np.float32))
 
-    def process(self, frame: np.ndarray) -> np.ndarray:
+    def process(self, frame: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
         if frame.ndim != 3 or frame.shape[:2] != self.mask.shape or frame.shape[2] != 3 or frame.dtype != np.uint8:
             raise ValueError("영상 프레임 해상도/형식이 마스크와 일치하지 않습니다.")
+        if mask is not None:
+            if mask.shape != self.mask.shape or mask.dtype != np.uint8:
+                raise ValueError("동적 마스크의 형태가 영상과 일치하지 않습니다.")
+            self.mask = mask
+            self.box = mask_bbox(mask, max(12, self.options.radius*5))
+            if self.options.method == "temporal":
+                bx0, by0, bx1, by1 = self.box
+                self.grid_x, self.grid_y = np.meshgrid(
+                    np.arange(bx1-bx0, dtype=np.float32),
+                    np.arange(by1-by0, dtype=np.float32))
         x0, y0, x1, y1 = self.box
+        if x0 >= x1 or y0 >= y1:
+            # A frame with no confident detections is passed through unchanged;
+            # do not invent a reconstruction when there is no target mask.
+            self.previous_original = frame.copy() if self.options.method == "temporal" else None
+            self.previous_result = frame.copy() if self.options.method == "temporal" else None
+            return frame.copy()
+        if cv2.countNonZero(self.mask) == frame.shape[0] * frame.shape[1]:
+            raise ValueError("동적 마스크가 전체 프레임을 덮고 있습니다.")
         input_roi = frame[y0:y1, x0:x1]
         mask_roi = self.mask[y0:y1, x0:x1]
         restored_roi = cv2.inpaint(input_roi, mask_roi, self.options.radius, cv2.INPAINT_TELEA)
@@ -163,7 +181,8 @@ def ffmpeg_args(binary: str, width: int, height: int, fps: float, source: Path,
 
 
 def restore_video(planned: PlannedJob, options: Options, stop: threading.Event | None = None,
-                  progress: Callable[[Progress], None] | None = None) -> Path:
+                  progress: Callable[[Progress], None] | None = None,
+                  generated_video: Path | None = None) -> Path:
     """Decode -> independent inpaint -> encode/remux. Partial output is never published.
 
     No shell, no Jasna. Caller owns worker thread. Video is assumed constant FPS.
@@ -180,6 +199,7 @@ def restore_video(planned: PlannedJob, options: Options, stop: threading.Event |
     out_file: Path | None = None
     proc: subprocess.Popen | None = None
     log_path: Path | None = None
+    generated_capture = None
     try:
         width = int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -187,8 +207,32 @@ def restore_video(planned: PlannedJob, options: Options, stop: threading.Event |
         total = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
         if not 0 < fps <= 1000 or width <= 0 or height <= 0:
             raise ValueError("영상 FPS 또는 해상도가 올바르지 않습니다.")
-        mask_image = read_mask(planned.mask_path) if planned.mask_path else None
-        mask = make_mask((height, width), rectangle=planned.job.rectangle, image=mask_image)
+        if generated_video is not None:
+            generated_capture = cv2.VideoCapture(str(generated_video))
+            if not generated_capture.isOpened():
+                raise ValueError("LTX 생성 영상을 열 수 없습니다.")
+            if (int(generated_capture.get(cv2.CAP_PROP_FRAME_WIDTH)) != width or
+                int(generated_capture.get(cv2.CAP_PROP_FRAME_HEIGHT)) != height or
+                abs(float(generated_capture.get(cv2.CAP_PROP_FPS)) - fps) > 0.01):
+                raise ValueError("LTX 생성 영상 해상도/FPS가 원본과 다릅니다.")
+        detector = tracker = None
+        if planned.job.auto_detect:
+            from .detection import OnnxConfig, OnnxMosaicDetector
+            from .tracking import MosaicTracker
+            detector = OnnxMosaicDetector(OnnxConfig(
+                model=options.detector_model,
+                confidence=options.detector_confidence,
+                cuda=options.detector_cuda,
+                format=options.detector_format,
+                mosaic_class=options.detector_class,
+                input_size=options.detector_input_size))
+            tracker = MosaicTracker(min_iou=options.tracker_iou,
+                                    max_gap=options.tracker_gap,
+                                    padding=options.tracker_padding)
+            mask = np.zeros((height, width), dtype=np.uint8)
+        else:
+            mask_image = read_mask(planned.mask_path) if planned.mask_path else None
+            mask = make_mask((height, width), rectangle=planned.job.rectangle, image=mask_image)
         processor = SpatialTemporalInpaint(mask, options)
         planned.target.parent.mkdir(parents=True, exist_ok=True)
         # Unique staging file + exclusive creation avoids collisions among processes.
@@ -211,7 +255,17 @@ def restore_video(planned: PlannedJob, options: Options, stop: threading.Event |
                 ok, frame = video.read()
                 if not ok:
                     break
-                result = processor.process(frame)
+                moving_mask = tracker.update(frame, detector.detect(frame)) if detector is not None else mask
+                if generated_capture is not None:
+                    gen_ok, generated_frame = generated_capture.read()
+                    if not gen_ok:
+                        raise ValueError("LTX 생성 영상이 원본보다 짧습니다.")
+                    result = frame.copy()
+                    cv2.copyTo(generated_frame, moving_mask, result)
+                elif detector is not None:
+                    result = processor.process(frame, moving_mask)
+                else:
+                    result = processor.process(frame)
                 assert proc.stdin is not None
                 proc.stdin.write(result.tobytes())
                 count += 1
@@ -220,6 +274,8 @@ def restore_video(planned: PlannedJob, options: Options, stop: threading.Event |
                     progress(Progress(count, total, count/elapsed))
             if count == 0:
                 raise ValueError("입력 영상에 유효한 프레임이 없습니다.")
+            if generated_capture is not None and generated_capture.read()[0]:
+                raise ValueError("LTX 생성 영상에 원본보다 많은 프레임이 있습니다.")
             # CAP_PROP_FRAME_COUNT can be estimated for some containers, hence 1 frame tolerance.
             if total > 1 and count < total - 1:
                 raise ValueError(f"영상 디코딩이 조기에 중단되었습니다: {count}/{total} 프레임")
@@ -244,6 +300,8 @@ def restore_video(planned: PlannedJob, options: Options, stop: threading.Event |
         raise RuntimeError(f"영상 파이프라인 실패: {exc}. FFmpeg: {detail}") from exc
     finally:
         video.release()
+        if generated_capture is not None:
+            generated_capture.release()
         if proc and proc.poll() is None:
             proc.kill()
             proc.wait()
